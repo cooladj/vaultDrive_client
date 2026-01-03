@@ -1,0 +1,237 @@
+﻿syntax = "proto3";
+
+package vaultdrive;
+
+// ============================================================================
+// REQUEST MESSAGES
+// ============================================================================
+
+message Request {
+  oneof request_type {
+    AuthenticateRequest authenticate = 1;
+    ReadFileRequest read_file = 2;
+    WriteFileRequest write_file = 3;
+    DeleteFileRequest delete_file = 4;
+    RenameFileRequest rename_file = 5;
+    ListDirectoryRequest list_directory = 6;
+    CreateDirectoryRequest create_directory = 7;
+    DeleteDirectoryRequest delete_directory = 8;
+    GetFileInfoRequest get_file_info = 9;
+    ListVolumesRequest list_volumes = 10;
+    GetVolumeInfoRequest get_volume_info = 11;
+    Watch watch= 12;
+    OpenFileRequest open_file = 13;
+    LockRequest lock_file = 14;
+    CreateFileRequest create_file = 15;
+    CloseFileRequest close_file = 16;
+    OverrideFileRequest override_file = 17;
+  }
+}
+
+// ============================================================================
+// RESPONSE MESSAGES
+// ============================================================================
+
+message Response {
+  oneof response_type {
+    AuthenticationSuccessResponse authentication_success = 1;
+    FileDataResponse file_data = 2;
+    WriteSuccessResponse write_success = 3;
+    OperationSuccessResponse operation_success = 4;
+    DirectoryListingResponse directory_listing = 5;
+    FileInfoResponse file_info = 6;
+    VolumeListResponse volume_list = 7;
+    VolumeInfoResponse volume_info = 8;
+    ErrorResponse error = 9;
+    Watch watch = 10;
+  }
+}
+
+// ============================================================================
+// AUTHENTICATION
+// ============================================================================
+
+message AuthenticateRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message CloseFileRequest{
+  uint64 file_handler = 1;
+}
+
+
+message AuthenticationSuccessResponse {
+  string host_name = 1;
+  string user_id = 2;
+
+  optional uint32 port = 3;
+
+}
+
+message OverrideFileRequest{
+  uint64 file_id =1;
+}
+
+
+
+// ============================================================================
+// FILE OPERATIONS
+// ============================================================================
+
+message ReadFileRequest {
+  string path = 1;
+  uint64 offset = 2;
+  uint32 length = 3;
+  uint64 file_id =4;
+}
+message CreateFileRequest{
+  string path =1;
+  uint64 file_id =4;
+  uint32 flags = 5;
+}
+
+message FileDataResponse {
+  bytes data = 1;
+  uint64 offset = 2;
+}
+message OpenFileRequest{
+  string path =1;
+  uint64 file_id =3;
+  uint32 flags = 4;
+}
+
+message WriteFileRequest {
+  string path = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  uint64 file_id =5;
+  uint32 flags =6;
+}
+
+message LockRequest{
+  uint64 offset =1;
+  uint64 length=2;
+  uint64 file_id=3;
+  bool wait=4;
+  bool test=5;
+  uint32 flags=6;
+
+}
+
+message WriteSuccessResponse {
+  uint64 bytes_written = 1;
+}
+
+message DeleteFileRequest {
+  string path = 1;
+}
+
+
+message RenameFileRequest {
+  string old_path = 1;
+  string new_path = 2;
+}
+
+message GetFileInfoRequest {
+  string path = 1;
+}
+
+message FileInfoResponse {
+  string name = 1;
+  string path = 2;
+  uint64 size = 3;
+  bool is_directory = 4;
+  int64 created_at = 5;
+  int64 modified_at = 6;
+  int64 accessed_at = 7;
+
+  uint32 flags =8;
+}
+
+// ============================================================================
+// DIRECTORY OPERATIONS
+// ============================================================================
+
+message ListDirectoryRequest {
+  string path = 1;
+}
+
+message DirectoryListingResponse {
+  repeated DirectoryEntry entries = 1;
+}
+
+message DirectoryEntry {
+  string name = 1;
+  bool is_directory = 2;
+  uint64 size = 3;
+  int64 modified = 4;
+}
+
+message CreateDirectoryRequest {
+  string path = 1;
+}
+
+message DeleteDirectoryRequest {
+  string path = 1;
+}
+
+// ============================================================================
+// VOLUME OPERATIONS
+// ============================================================================
+
+message ListVolumesRequest {
+  // No fields needed
+}
+
+message VolumeListResponse {
+  repeated VolumeInfo volumes = 1;
+}
+
+message GetVolumeInfoRequest {
+  string volume_id = 1;
+}
+
+message VolumeInfoResponse {
+  VolumeInfo volume = 1;
+}
+
+message VolumeInfo {
+  string id = 1;
+  string name = 2;
+  string root_path = 3;
+  uint64 total_size = 4;
+  uint64 available_space = 5;
+}
+
+message Watch{
+  string drive = 1;
+  repeated  string path = 2;
+}
+
+
+
+// ============================================================================
+// COMMON TYPES
+// ============================================================================
+
+message OperationSuccessResponse {
+  string message = 1;
+}
+
+message ErrorResponse {
+  string message = 1;
+  ErrorCode code = 2;
+}
+
+enum ErrorCode {
+  INTERNAL_ERROR = 0;
+  PERMISSION_DENIED = 1;
+  NOT_FOUND = 2;
+  ALREADY_EXISTS = 3;
+  INVALID_REQUEST = 4;
+  AUTHENTICATION_FAILED = 5;
+  SESSION_EXPIRED = 6;
+  QUOTA_EXCEEDED = 7;
+  IO_ERROR = 8;
+}

@@ -1,0 +1,93 @@
+[package]
+name = "vaultdrive-client"
+version = "1.0.0"
+edition = "2024"
+authors = ["Anthony Jakson"]
+description = "Secure remote file access client over QUIC"
+license = "AGPL-3"
+
+[[bin]]
+name = "vaultdrive"
+path = "src/main.rs"
+
+[dependencies]
+# QUIC networking
+quinn = { version = "0.11.9", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
+rustls = { version = "0.23.34", default-features = false, features = ["aws-lc-rs"] }
+
+# Protocol buffers
+prost = "0.14.1"
+bytes = "1.5"
+
+
+interprocess = { version = "2.2.3", features = ["tokio"] }
+postcard = {version = "1.1.3", features = ["alloc"]}
+
+
+
+# Async runtime
+tokio = { version = "1.48.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+egui = "0.33.2"
+egui-async = "0.3.2"
+
+
+# Error handling
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Caching and utilities
+
+parking_lot = "0.12.5"
+dashmap = "7.0.0-rc2"
+x509-parser = "0.18.0"
+rcgen = { version = "0.14.5", default-features = false, features = ["aws_lc_rs"] }
+once_cell = "1.21.3"
+log = "0.4.28"
+dirs = "6.0.0"
+webpki-roots = "1.0.4"
+eframe = "0.33.2"
+futures = "0.3.31"
+strum_macros = "0.27.2"
+strum = "0.27.2"
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+serde = { version = "1.0.228", features = ["derive"] }
+
+# Platform-specific filesystem
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Services",
+    "Win32_Security",
+    "Win32_Security_Authorization"
+] }
+winfsp = { version = "0.12.4+winfsp-2.1", features = ["full", "windows-62", "system", "debug"]}
+winfsp-sys = "0.12.1+winfsp-2.1"
+winreg = "0.55.0"
+
+[target.'cfg(unix)'.dependencies]
+fuser = "0.16.0"
+libc = "0.2.177"
+nix = "0.31.1"
+
+[build-dependencies]
+prost-build = "0.14.1"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winfsp = "0.12.4"
+
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
