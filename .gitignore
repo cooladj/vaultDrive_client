@@ -1,0 +1,81 @@
+# ===============================================
+# BUILD OUTPUT
+# ===============================================
+# Cargo build directory
+/target/
+
+# Debug and release builds
+debug/
+release/
+
+# ===============================================
+# DEPENDENCY / BUILD CACHE
+# ===============================================
+# Cargo registry and build cache
+.cargo/
+.cargo-lock
+**/*.rs.bk
+
+# If you use cargo install --path or local crates
+*.crate
+
+# ===============================================
+# RUST TOOLING / COVERAGE
+# ===============================================
+# Profiling and coverage data
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+
+# Flamegraph / perf outputs
+flamegraph.svg
+perf.data*
+
+# ===============================================
+# LOGS / TEMP / BACKUPS
+# ===============================================
+*.log
+*.tmp
+*.bak
+*.old
+
+# ===============================================
+# TEST / BENCHMARK OUTPUTS
+# ===============================================
+/tests/tmp/
+benches/*.out
+examples/*.out
+
+# ===============================================
+# IDEs / EDITORS
+# ===============================================
+.vscode/
+.idea/
+*.iml
+*.sublime-project
+*.sublime-workspace
+
+# ===============================================
+# SYSTEM FILES
+# ===============================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===============================================
+# OPTIONAL: Uncomment as needed
+# ===============================================
+# Cargo.lock — if this is a library crate (not binary)
+# Cargo.lock
+
+# Generated code (Protobufs, build.rs outputs)
+# /src/network/protocol/*.rs
+# /generated/
+
+# Ignore everything in keys/
+certs/*
+
+# But keep the folder itself
+!certs/
+

@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package hub;
+
+
+message HubRequest {
+  oneof request_type {
+    ServerHelloRequest server_hello_req = 1;
+    ServerHelloResponse server_hello_res = 2;
+    AdmitResponse admit_res = 5;
+    KeepAliveRequest keep_alive_req = 6;
+    KeepAliveResponse keep_alive_res = 7;
+    NatPokeRequest nat_poke_req = 8;
+    NatPokeResponse nat_poke_res = 9;
+    HealthCheckRequest health_req = 10;
+    HealthCheckResponse health_res = 11;
+    CreateCheckoutSessionRequest checkout_req = 12;
+    CreateCheckoutSessionResponse checkout_res = 13;
+    ClientHelloRequest client_hello_req = 14;
+    ClientHelloResponse client_hello_res = 15;
+    HostNameRequest hostname_req= 16;
+    HostNameResponse hostname_res=17;
+  }
+}
+
+
+message ServerHelloRequest {
+  string device_id = 2;
+}
+
+message ServerHelloResponse {
+  bool accepted = 1;
+  optional string reason = 2;
+}
+
+message HostNameRequest{
+}
+message HostNameResponse{
+  string hostname = 1;
+}
+
+message AdmitResponse {
+  bool ok = 1;
+  optional string reason = 2;
+  optional string hostname =3;
+}
+
+// Hub-initiated keep-alive (server only responds)
+message KeepAliveRequest {
+  string unique_id = 1;
+}
+
+message KeepAliveResponse {
+  bool alive = 1;
+}
+
+// Hub-initiated NAT traversal
+message NatPokeRequest {
+  string client_ip = 1;
+  uint32 client_port = 2;
+}
+
+message NatPokeResponse {
+  bool reached = 1;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string status = 1;
+  int64 uptime_seconds = 2;
+  int32 active_servers = 3;
+}
+
+
+message CreateCheckoutSessionRequest {
+  string id = 1;
+}
+
+message CreateCheckoutSessionResponse {
+  string checkout_url = 1;
+  string id = 2;
+  bool new = 3;
+}
+
+// Client server discovery
+message ClientHelloRequest {
+  string unique_id = 1;
+}
+
+message ClientHelloResponse {
+  bool found = 1;
+  optional string socket_addr = 2;
+}
