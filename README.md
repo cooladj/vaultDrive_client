@@ -28,7 +28,7 @@ VaultDrive provides a custom, cross-platform implementation of virutal drive ove
 ## TODO
 
 - [ ] Fix Windows bug causing JetBrains safe-write operations to report failure despite successful writes
-- [ ] Complete FUSE implementation testing
+- [ ] Complete FUSE implementation/testing
 - [ ] UI improvements
 - [ ] Code cleanup and refactoring
 
