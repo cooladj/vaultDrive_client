@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, anyhow};
 use quinn::{Connection, Endpoint, RecvStream, SendStream, ClientConfig, TransportConfig, congestion};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -20,7 +20,7 @@ use crate::client::{ VAULT_DRIVE_MAP};
 use crate::commands::{connectionDirect, connectionHub};
 
 pub struct QuicClient {
-    endpoint: Endpoint,
+    pub(crate) endpoint: Endpoint,
     pub connection: DashMap<SocketAddr,Connection>,
     pub reAuth: tokio::sync::Notify
 
@@ -110,6 +110,7 @@ impl QuicClient {
 
         Ok((cert_der, key_der))
     }
+
 
 
 

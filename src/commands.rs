@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::fs;
@@ -16,10 +16,9 @@ use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
-use crate::auth::session;
 use crate::client::{VAULT_DRIVE_MAP, VaultDriveClient};
 use crate::driveManagerUI::{Connection, ConnectionType, Drive};
-use crate::filesystem::{mount_to_UI_tuple, unmount};
+use crate::filesystem::{mount_to_UI_tuple};
 use crate::network::ZERO_ADDR;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -32,6 +31,10 @@ pub enum SocketCommand {
     },
     UnMount {
         mount_point: String,
+        username: String,
+        socketaddr: SocketAddr,
+
+
     },
 
     Mount {
@@ -45,6 +48,12 @@ pub enum SocketCommand {
         connection: Option<Connection>
     },
     Health,
+
+    Disconnect{
+        username:String,
+        socketaddr: SocketAddr,
+
+    }
 
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -94,8 +103,8 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
                 Err(e) => CommandResponse::Error(e.to_string()),
             }
         }
-        SocketCommand::UnMount { mount_point} => {
-            match execute_unmount(mount_point).await {
+        SocketCommand::UnMount { mount_point, username, socketaddr} => {
+            match execute_unmount(mount_point, socketaddr, username).await {
                 Ok(_) => CommandResponse::Success(ResponseData::Empty),
                 Err(e) => CommandResponse::Error(e.to_string()),
             }
@@ -116,6 +125,14 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
             }
 
         }
+        SocketCommand::Disconnect {username, socketaddr} => {
+
+            match execute_disconnect(username, socketaddr).await {
+                Ok(_) => CommandResponse::Success(ResponseData::Empty),
+                Err(e) => CommandResponse::Error(e.to_string()),
+            }
+        }
+        ,
 
         SocketCommand::Health  => {
             CommandResponse::Success(ResponseData::Text(String::from("Pong")))
@@ -169,8 +186,32 @@ pub async fn send_command_to_daemon(command: SocketCommand) -> Result<CommandRes
 }
 
 
-pub async fn execute_unmount(mount_Point: String) -> Result<()>{
-    unmount(&*mount_Point).await?;
+pub async fn execute_unmount(mount_point: String, server: SocketAddr, username:String) -> Result<()>{
+    let client = VAULT_DRIVE_MAP
+        .get(&(server, username.to_string()))
+        .map(|entry| entry.clone())
+        .ok_or_else(|| anyhow!("Client not found"))?;
+
+    let host = client.mounts
+        .remove(&mount_point)
+        .context("There is no mount");
+    drop(host);
+
+    Ok(())
+}
+
+pub async fn execute_disconnect(username: String, server: SocketAddr) -> Result<()>{
+    debug!("Disconnecting from vaultDrive: {:?} and username: {:?}", server, username);
+    let client = VAULT_DRIVE_MAP
+        .remove(&(server, username.to_string()))
+        .map(|entry| entry.clone())
+        .ok_or_else(|| anyhow!("Client not found"))?;
+
+    // Have to call clear first because the the virtual file system own the ARC
+    // if you dont clear before calling drop you will just decrement the arc and not drop the vale
+    client.1.mounts.clear();
+
+    drop(client);
     Ok(())
 }
 
@@ -187,13 +228,19 @@ pub async fn execute_get_ui_connections() -> Result<Vec<Connection>> {
 
     debug!("{:?} this is the client length", clients.len());
 
+    if clients.len() == 0 {
+        return Ok(Vec::new());
+    }
+
     let mut set = JoinSet::new();
+
+
 
     for client in clients {
         set.spawn(async move {
             let (volumes_result, mount_result, session_guard) = join!(
                 client.list_volumes(),
-                mount_to_UI_tuple(),
+                mount_to_UI_tuple(client.clone()),
                 client.session.read()
             );
 

@@ -8,18 +8,26 @@ use dashmap::{DashMap, DashSet};
 use keyring::Entry;
 use log::info;
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use tokio::join;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::debug;
+use winfsp::host::FileSystemHost;
 use crate::auth::{authenticate, session};
 use crate::driveManagerUI::ConnectionType;
+use crate::filesystem::winfsp::{VirtualFileSystem};
 use crate::network::{QuicClient, read_message, write_message, ZERO_ADDR};
 use crate::proto::hub;
 use crate::proto::hub::hub_request::RequestType;
 use crate::proto::hub::{ClientHelloRequest, ClientHelloResponse};
 use crate::proto::vaultdrive::*;
+
+#[cfg(windows)]
+type MOUNT_TYPES = Mutex<FileSystemHost<VirtualFileSystem>>;
+#[cfg(unix)]
+type MOUNT_TYPES = Arc<Mutex<fuser::BackgroundSession>>;
 
 
 /// VaultDrive client
@@ -28,6 +36,7 @@ pub struct VaultDriveClient {
     pub session: Arc<RwLock<Option<session>>>,
     pub server_addr: RwLock<SocketAddr>,
     pub mount_points: DashSet<String>,
+    pub mounts: DashMap<String, (MOUNT_TYPES, String)>
 
 }
 
@@ -48,6 +57,7 @@ impl VaultDriveClient {
             session: Arc::new(RwLock::new(None)),
             server_addr: RwLock::new(server_addr),
             mount_points: DashSet::new(),
+            mounts: DashMap::new(),
         });
 
         Ok(client)
@@ -198,9 +208,10 @@ impl VaultDriveClient {
                               connection_point,
         );
         let entry = Entry::new(&service, session.authenticate_request.user_id.as_str())?;
-        let result=authenticate(&mut send, &mut recv, session.authenticate_request.user_id.as_str(), entry.get_password()?.as_str() ).await;
+        let result=authenticate(&mut send, &mut recv, session.authenticate_request.user_id.as_str(), entry.get_password()?.as_str(), server_addr ).await;
         if result.is_err(){
-            entry.delete_credential()?;
+            entry.delete_credential();
+
         }else {
             self.quic.reAuth.notify_waiters();
         }
@@ -218,7 +229,7 @@ impl VaultDriveClient {
 
         tracing::debug!("authenticate_internal: Stream opened successfully, calling authenticate");
 
-        let result = authenticate(&mut send, &mut recv, username, entry.get_password()?.as_str()).await;
+        let result = authenticate(&mut send, &mut recv, username, entry.get_password()?.as_str(), server_addr).await;
 
         if result.is_err(){
             entry.delete_credential()?;
@@ -498,6 +509,23 @@ impl VaultDriveClient {
             _ => bail!("Unexpected response type for get volume info"),
         }
     }
+    fn do_cleanup(&self, session: &session, server_addr: &SocketAddr) {
+        let (connection_type, connection_point) = match &session.hostname {
+            None => (ConnectionType::Direct, server_addr.to_string()),
+            Some(hostname) => (ConnectionType::Hub, hostname.clone()),
+        };
+        let username = session.authenticate_request.user_id.to_string();
+
+       VAULT_DRIVE_MAP.remove(&(server_addr.clone(), username));
+
+        self.mounts.clear();
+
+        let service = format!("vaultDrive|{}|{}", connection_type, connection_point);
+
+        if let Ok(entry) = Entry::new(&service, &session.authenticate_request.user_id) {
+            let _ = entry.delete_credential();
+        }
+    }
     
     pub async fn disconnect(&self) {
         let (server_addr_guard, session_guard) = join!(
@@ -516,27 +544,23 @@ impl VaultDriveClient {
 impl Drop for VaultDriveClient {
     fn drop(&mut self) {
 
-        self.disconnect();
-        let session_guard = self.session.blocking_read();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            debug!("Tokio runtime is ok");
+            tokio::task::block_in_place(|| {
+                debug!("Blocking tokio thread to perform cleanup");
+                let session_guard = self.session.blocking_read();
+                if let Some(session) = &*session_guard {
+                    let server_addr = self.server_addr.blocking_read();
+                    self.do_cleanup(session, &server_addr);
+                }
+            });
+        } else {
 
-        let session = match &*session_guard {
-            None => return,
-            Some(s) => s,
-        };
-
-        let server_addr = *self.server_addr.blocking_read();
-        let (connection_type ,connection_point) = match session.hostname.clone() {
-            None => { (ConnectionType::Direct,server_addr.to_string() )}
-            Some(hostname) => {(ConnectionType::Hub,hostname)}
-        };
-        let service = format!("vaultDrive|{}|{}",
-                              connection_type,
-                              connection_point,
-        );
-        let entry = match Entry::new(&service, session.authenticate_request.user_id.as_str()){
-            Ok(entry) => entry,
-            Err(_) => return,
-        };
-        entry.delete_credential().expect("panic");
+            let session_guard = self.session.blocking_read();
+            if let Some(session) = &*session_guard {
+                let server_addr = self.server_addr.blocking_read();
+                self.do_cleanup(session, &server_addr);
+            }
+        }
     }
 }

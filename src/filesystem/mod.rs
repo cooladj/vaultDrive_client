@@ -40,30 +40,22 @@ pub async fn mount(
 }
 
 
-/// Unmount the filesystem
-pub async fn unmount( mount_point: &str) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    winfsp::unmount(mount_point).await?;
 
-    #[cfg(unix)]    fuse::unmount(mount_point)?;
+/// this return a tuple of (path, drivename)
+pub async fn mount_to_UI_tuple(client: Arc<VaultDriveClient> ) -> Result<Vec<(Arc<str>, Arc<str>)>> {
+        debug!("mount_map_to_tuple: {} mounts", client.mounts.len());
 
-    #[cfg(not(any(target_os = "windows", unix)))]
-    anyhow::bail!("Filesystem mounting not supported on this platform");
+        let results: Vec<(Arc<str>, Arc<str>)> = client.mounts
+            .iter()
+            .map(|entry| {
+                let (k, (_, label)) = entry.pair();
+                (Arc::<str>::from(k.as_str()), Arc::<str>::from(label.as_str()))
+            })
+            .collect();
 
-    Ok(())
-}
+        Ok(results)
+    
 
-pub async fn mount_to_UI_tuple( ) -> Result<Vec<(Arc<str>, Arc<str>)>> {
-    #[cfg(target_os = "windows")]
-    let result=winfsp::mount_map_to_tuple().await?;
-
-
-    #[cfg(unix)]
-    let result=fuse::mount_map_to_tuple().await?;
-
-    debug!("this is the mount tuple {:?}", result);
-
-    Ok(result)
 }
 
 pub const READ: u32 = 1 << 0;

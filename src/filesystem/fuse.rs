@@ -1274,7 +1274,7 @@ pub async fn mount(
     let session = fuser::spawn_mount2(fs, &mount_point, &options)
         .context("Failed to mount filesystem")?;
 
-    MOUNTS.insert(
+    client.mounts.insert.insert(
         mount_point.clone(),
         (Arc::new(Mutex::new(session)), drive.to_string()),
     );
@@ -1285,29 +1285,8 @@ pub async fn mount(
     Ok(())
 }
 
-pub async fn unmount(mount_point: &str) -> Result<()> {
-    info!("Unmounting VaultDrive at {}", mount_point);
 
-    if let Some((_, (session, _))) = MOUNTS.remove(mount_point) {
-        drop(session);
-    }
 
-    Ok(())
-}
-
-pub async fn mount_map_to_tuple() -> Result<Vec<(Arc<str>, Arc<str>)>> {
-    debug!("mount_map_to_tuple: {} mounts", MOUNTS.len());
-
-    let results: Vec<(Arc<str>, Arc<str>)> = MOUNTS
-        .iter()
-        .map(|entry| {
-            let (k, (_, label)) = entry.pair();
-            (Arc::<str>::from(k.as_str()), Arc::<str>::from(label.as_str()))
-        })
-        .collect();
-
-    Ok(results)
-}
 
 fn normalize_mount_point(raw: &str) -> Result<String> {
     let trimmed = raw.trim();

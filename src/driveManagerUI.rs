@@ -194,7 +194,52 @@ impl eframe::App for DriveManagerApp {
                                 .size(16.0)
                                 .strong()
                         );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+
+                            let disconnect_response = ui.add_sized(
+                                [160.0, 40.0],
+                                egui::Button::new(RichText::new("+ Discount ").size(14.0))
+                                    .fill(Color32::from_rgb(20, 20, 20))
+                                    .stroke(Stroke::NONE)
+                                    .corner_radius(6.0)
+
+
+                            );
+
+
+                            if disconnect_response.clicked() {
+                                let conn_clone = connection.clone();
+                                let _ = self.connect_bind.read_or_request(|| {
+                                    async move {
+
+                                        match send_command_to_daemon(SocketCommand::Disconnect {
+                                            username: conn_clone.username,
+                                            socketaddr: conn_clone.ip_addr,
+                                        }
+                                        ).await {
+                                            Ok(_) => {
+                                                match send_command_to_daemon(SocketCommand::Volumes{
+                                                    connection:None
+                                                }).await {
+                                                    Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => {
+                                                        Ok(connections)
+                                                    }
+                                                    _ => { Ok(vec![]) }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                Err(e.to_string())
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+
+                        });
+
                     });
+
 
                     ui.add_space(15.0);
 
@@ -457,6 +502,8 @@ impl DriveManagerApp {
                                 }
                                 else {
                                     (SocketCommand::UnMount {
+                                        username,
+                                        socketaddr: ip_addr,
                                         mount_point: drive.mount_path.clone(),
                                     }, Operation::MOUNT)
                                 };

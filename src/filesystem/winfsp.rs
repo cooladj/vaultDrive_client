@@ -18,6 +18,7 @@ use tokio::sync::OnceCell;
 use once_cell::sync::{Lazy};
 use dashmap::DashMap;
 use log::debug;
+use path_slash::PathExt;
 use strum_macros::Display;
 use tokio::runtime::{Handle};
 use tokio::sync::oneshot::error::RecvError;
@@ -226,7 +227,6 @@ struct PendingRequest {
 impl VirtualFileSystem {
     pub fn new(
         client: Arc<VaultDriveClient>,
-        cache_size_mb: usize,
         handle: Handle,
         drive: &str,
     ) -> Self {
@@ -242,6 +242,12 @@ impl VirtualFileSystem {
         }
     }
 
+    fn to_unix_path(&self, path: &str) -> String {
+        Path::new(path)
+            .to_slash_lossy()
+            .to_string()
+    }
+
     fn normalize_path(&self, path: &str) -> String {
         let mut normalized = path.replace('/', "\\");
         if !normalized.starts_with('\\') {
@@ -251,9 +257,6 @@ impl VirtualFileSystem {
             normalized = normalized.trim_end_matches('\\').to_string();
         }
         normalized
-    }
-    fn to_unix_path(&self, path: &str) -> String {
-        path.replace('\\', "/")
     }
 
 
@@ -1126,16 +1129,6 @@ impl AsyncFileSystemContext for VirtualFileSystem {
 }
 
 
-pub async fn unmount(mount_point: &str) -> Result<()> {
-    // Remove from map first
-    let host = MOUNTS
-            .remove(mount_point)
-            .context("There is no mount");
-    drop(host);
-    Ok(())
-}
-
-
 
 
 ///todo add support for chosoing a random drive, Problem now if a random letter is choose, I have no idea have to accuractly get said info
@@ -1145,7 +1138,7 @@ pub async fn mount(client: Arc<VaultDriveClient>, mount_point: &str, drive: &str
 
     let mount_point = normalize_mount_point(mount_point)?;
     let handle = Handle::current();
-    let fs = VirtualFileSystem::new(client.clone(), 100, handle, drive);
+    let fs = VirtualFileSystem::new(client.clone(),  handle, drive);
 
     let mut volume_params = VolumeParams::new();
     volume_params.sector_size(512);
@@ -1175,27 +1168,12 @@ pub async fn mount(client: Arc<VaultDriveClient>, mount_point: &str, drive: &str
 
     tracing::info!("Starting dispatcher threads...");
     host.start().context("Failed to start FSP dispatcher")?;
-    MOUNTS.insert(mount_point.clone(), (Mutex::new(host), drive.to_string()));
+    client.mounts.insert(mount_point.clone(), (Mutex::new(host), drive.to_string()));
     client.mount_points.insert(mount_point.clone());
 
 
 
     Ok(())
-}
-
-/// this return a tuple of (path, drivename)
-pub async fn mount_map_to_tuple() -> Result<Vec<(Arc<str>, Arc<str>)>> {
-    debug!("this is the mount len {:?}", MOUNTS.len());
-
-    let results: Vec<(Arc<str>, Arc<str>)> = MOUNTS
-        .iter()
-        .map(|entry| {
-            let (k, (_host, label)) = entry.pair();
-            (Arc::<str>::from(k.as_str()), Arc::<str>::from(label.as_str()))
-        })
-        .collect();
-
-    Ok(results)
 }
 
 
