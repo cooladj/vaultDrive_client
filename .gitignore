@@ -39,6 +39,7 @@ perf.data*
 *.tmp
 *.bak
 *.old
+*.db
 
 # ===============================================
 # TEST / BENCHMARK OUTPUTS

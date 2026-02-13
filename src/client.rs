@@ -112,7 +112,7 @@ impl VaultDriveClient {
     }
 
 
-    pub async fn connect(self: Arc<Self>, username: &str, entry: &Entry, hostname: Option<String>) -> Result<()> {
+    pub async fn connect(self: Arc<Self>, username: &str, entry: &Entry, hostname: Option<String>) -> Result<SocketAddr> {
         tracing::debug!("Connecting to Vault Drive for user {:?}", username);
         let server_addr = *self.server_addr.read().await;
 
@@ -134,7 +134,7 @@ impl VaultDriveClient {
 
         VAULT_DRIVE_MAP.insert((server_addr, session.authenticate_request.user_id), self);
         tracing::debug!("{:?} this is the VAULT DRIVE CLIENT MAP", VAULT_DRIVE_MAP.len());
-        Ok(())
+        Ok(server_addr)
     }
 
 

@@ -6,6 +6,7 @@ use tracing;
 use std::time::Duration;
 use egui::TextBuffer;
 use futures::{SinkExt, StreamExt};
+use futures::future::join_all;
 use interprocess::local_socket;
 use interprocess::local_socket::{GenericFilePath, ToFsName};
 use interprocess::local_socket::traits::tokio::Stream;
@@ -15,7 +16,9 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use keyring::Entry;
+use rusqlite::fallible_iterator::FallibleIterator;
 use serde::{Deserialize, Serialize};
+use crate::autoRun::{auto_run, exists};
 use crate::client::{VAULT_DRIVE_MAP, VaultDriveClient};
 use crate::driveManagerUI::{Connection, ConnectionType, Drive};
 use crate::filesystem::{mount_to_UI_tuple};
@@ -33,8 +36,6 @@ pub enum SocketCommand {
         mount_point: String,
         username: String,
         socketaddr: SocketAddr,
-
-
     },
 
     Mount {
@@ -52,15 +53,12 @@ pub enum SocketCommand {
     Disconnect{
         username:String,
         socketaddr: SocketAddr,
-
-    }
-
+    },
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ResponseData {
     Text(String),
     Empty,
-    KeyData(String),
     VolumesInfoData(Vec<Connection>),
 }
 
@@ -92,7 +90,7 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
               connectionHub( &*connection_point, username.as_str(),&entry).await
           };
           match operation {
-              Ok(_) => CommandResponse::Success(ResponseData::Empty),
+              Ok(socket_addr) => CommandResponse::Success(ResponseData::Text(socket_addr.to_string())),
               Err(e) => CommandResponse::Error(e.to_string()),
           }
         }
@@ -219,6 +217,7 @@ pub async fn execute_disconnect(username: String, server: SocketAddr) -> Result<
 
 
 
+
 pub async fn execute_get_ui_connections() -> Result<Vec<Connection>> {
     let clients: Vec<Arc<VaultDriveClient>> =
         VAULT_DRIVE_MAP
@@ -228,63 +227,109 @@ pub async fn execute_get_ui_connections() -> Result<Vec<Connection>> {
 
     debug!("{:?} this is the client length", clients.len());
 
-    if clients.len() == 0 {
+    if clients.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut set = JoinSet::new();
 
-
-
     for client in clients {
         set.spawn(async move {
-            let (volumes_result, mount_result, session_guard) = join!(
+            let (volumes_result, mount_result, session_guard, server_addr_guard) = join!(
                 client.list_volumes(),
                 mount_to_UI_tuple(client.clone()),
-                client.session.read()
+                client.session.read(),
+                client.server_addr.read()
             );
 
             let volumes = volumes_result.unwrap_or_default();
             let mountUITuple = mount_result.unwrap_or_default();
             let session = session_guard.clone().unwrap();
+            let server_addr = server_addr_guard.clone();
 
             debug!("This is the mountUiTuple {:?}", mountUITuple.clone());
             drop(session_guard);
             tracing::debug!("{:?} this is the volumes length", volumes.len());
             tracing::debug!("{:?} this is the mountUITuple length", mountUITuple.len());
 
-            let username =  session.authenticate_request.user_id;
-            let drives: Vec<Drive> = volumes.into_iter()
-                .map(|volume| {
-                    let mount_info = mountUITuple.iter()
-                        .find(|(_, label)| label.as_ref() == volume.root_path);
+            let username = session.authenticate_request.user_id.clone();
 
+            // Prepare all exists checks and volume data separately
+            let mut exists_futures = Vec::new();
+            let mut volume_data = Vec::new();
 
-                    let (path, label) = match mount_info {
+            for volume in volumes {
+                let mount_info = mountUITuple.iter()
+                    .find(|(_, label)| label.as_ref() == volume.root_path);
 
-                        Some((p, l)) => (Some(p.as_ref()), Some(l.as_ref())),
-                        None => (None, None),
+                let (path, label) = match mount_info {
+                    Some((p, l)) => (Some(p.as_ref().to_string()), Some(l.as_ref().to_string())),
+                    None => (None, None),
+                };
+
+                let (connection_type, connection_point) = if let Some(hostname) = session.hostname.clone() {
+                    (ConnectionType::Hub, hostname.clone())
+                } else {
+                    (ConnectionType::Direct, server_addr.to_string())
+                };
+
+                let auto_run = auto_run::new(
+                    connection_type,
+                    connection_point,
+                    username.clone(),
+                    volume.root_path.clone(),
+                    "".to_string(),
+                );
+
+                // Spawn the blocking task
+                exists_futures.push(tokio::task::spawn_blocking(move || exists(auto_run)));
+
+                // Store the volume data
+                volume_data.push((volume, path, label));
+            }
+
+            // Await all exists checks concurrently
+            let exists_results = join_all(exists_futures).await;
+
+            // Build drives from results
+            let drives: Vec<Drive> = volume_data.into_iter()
+                .zip(exists_results.into_iter())
+                .map(|((volume, path, label), exists_result)| {
+                    let exist = match exists_result {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(e)) => {
+                            tracing::error!("exists check failed for {}: {:?}", volume.name, e);
+                            false
+                        }
+                        Err(e) => {
+                            tracing::error!("spawn_blocking failed for {}: {:?}", volume.name, e);
+                            false
+                        }
                     };
 
                     Drive::new(
                         &volume.name,
                         &volume.root_path,
-                        path.unwrap_or_default(),
+                        path.as_deref().unwrap_or_default(),
                         "",
                         label.is_some(),
                         volume.available_space / 1073741824,
                         volume.total_size / 1073741824,
+                        exist,
                     )
                 })
                 .collect();
 
-            Connection::new(client.server_addr.read().await.clone() , drives, username, session.authenticate_request.host_name)
+            Connection::new(
+                client.server_addr.read().await.clone(),
+                drives,
+                username,
+                session.authenticate_request.host_name,
+            )
         });
     }
 
     let mut connections = Vec::new();
-
-
 
     while let Some(result) = set.join_next().await {
         match result {
@@ -302,16 +347,16 @@ pub async fn execute_get_ui_connections() -> Result<Vec<Connection>> {
 }
 
 
-pub async fn connectionDirect( server: SocketAddr, username: &str, entry: &Entry) -> Result<()> {
+pub async fn connectionDirect( server: SocketAddr, username: &str, entry: &Entry) -> Result<SocketAddr> {
     tracing::debug!("Connecting to Direct Vault Drive for user {:?} socketaddr {:?}", username, server);
     let client = VaultDriveClient::new(server, username.parse()?).await?;
 
-    client.clone().connect(&username, entry, None).await?;
+    let server_addr = client.connect(&username, entry, None).await?;
     
     
-    Ok(())
+    Ok(server_addr)
 }
-pub async fn connectionHub( hostname: &str, username: &str,  entry: &Entry) -> Result<()> {
+pub async fn connectionHub( hostname: &str, username: &str,  entry: &Entry) -> Result<SocketAddr> {
     tracing::debug!("Connecting to hub Vault Drive for user {:?} ", username );
 
     //this is just used to make it default could make it an optional
@@ -319,10 +364,11 @@ pub async fn connectionHub( hostname: &str, username: &str,  entry: &Entry) -> R
     let defaultSockerAddr: SocketAddr = ZERO_ADDR;
     let client = VaultDriveClient::new(defaultSockerAddr, username.parse()?).await?;
     client.connect_to_hub( hostname).await?;
-    client.connect(username, entry, Some(hostname.to_string())).await?;
+    let server_addr = client.connect(username, entry, Some(hostname.to_string())).await?;
+
     
 
-    Ok(())
+    Ok(server_addr)
 
 }
 

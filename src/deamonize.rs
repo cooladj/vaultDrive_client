@@ -1,12 +1,14 @@
 ﻿use std::{env, io, process};
 use std::fs::{File, OpenOptions};
-use futures::{SinkExt, StreamExt};
+use std::net::SocketAddr;
+use futures::{SinkExt, StreamExt, TryFutureExt};
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName, };
 use interprocess::local_socket::traits::tokio::{Listener, };
 use log::{debug, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use crate::commands::{execute_socket_command, CommandResponse, SocketCommand};
+use crate::autoRun::{auto_run, create_table, get_auto_run};
+use crate::commands::{execute_socket_command, CommandResponse, ResponseData, SocketCommand};
 
 pub fn is_daemon_process() -> bool {
     std::env::var("IS_DAEMON").is_ok()
@@ -203,6 +205,49 @@ fn get_pid_file_path() -> String {
 }
 
 pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    {
+        tokio::spawn(async {
+            let auto = match tokio::task::spawn_blocking(|| {
+                create_table().ok()?;
+                get_auto_run().ok()
+            })
+                .await
+            {
+                Ok(Some(entries)) => entries,
+                _ => return,
+            };
+
+            for x in auto {
+                tokio::spawn(async move {
+                    let conn_command = SocketCommand::Connect {
+                        connection_type: x.connection_type,
+                        connection_point: x.connection_point.clone(),
+                        username: x.username.clone(),
+                    };
+
+                    match execute_socket_command(conn_command).await {
+                        CommandResponse::Success(ResponseData::Text(s)) => {
+                            let Ok(socketaddr) = s.parse::<std::net::SocketAddr>() else {
+                                return;
+                            };
+
+                            let mount_command = SocketCommand::Mount {
+                                mount_point: x.mount_point,  
+                                drive: x.host_drive,
+                                socketaddr,
+                                username: x.username,
+                            };
+
+                            execute_socket_command(mount_command).await;
+                        }
+                        _ => return,
+                    };
+                });
+            }
+        });
+    }
+
     #[cfg(unix)]
     let path_str = "/tmp/vaultDriveClient.sock";
 

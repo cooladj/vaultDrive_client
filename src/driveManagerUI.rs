@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use strum_macros::{Display, EnumIter};
 use strum::IntoEnumIterator;
-
-
+use crate::autoRun::auto_run;
 
 pub async fn runUI() -> eframe::Result<()> {
     let connections =match send_command_to_daemon(
@@ -67,13 +66,14 @@ pub struct Drive {
     mounted: bool,
     used_space_gb: u64,
     total_space_gb: u64,
+    auto_run: bool,
 
     editable_mount: String,
     editable_sync: String,
 }
 
 impl Drive {
-    pub fn new(name: &str, server_mount_point: &str, mount_path: &str, sync_path: &str,mounted: bool, used_gb: u64, total_gb: u64) -> Self {
+    pub fn new(name: &str, server_mount_point: &str, mount_path: &str, sync_path: &str,mounted: bool, used_gb: u64, total_gb: u64, auto_run: bool) -> Self {
         Self {
             name: name.to_string(),
             server_mount_point: server_mount_point.to_string(),
@@ -84,6 +84,7 @@ impl Drive {
             total_space_gb: total_gb,
             editable_mount: String::default(),
             editable_sync:String::default(),
+            auto_run
         }
     }
 
@@ -126,9 +127,9 @@ impl Default for DriveManagerApp {
                     username: "Jimmy".to_string(),
                     host_name: "JimmyDesktop".to_string(),
                     drive: vec![
-                        Drive::new("System Drive", "","C:\\", "", true, 320, 500),
-                        Drive::new("Data Drive", "","D:\\", "",true, 450, 1000),
-                        Drive::new("External Backup", "","E:\\", "",false, 1200, 2000),
+                        Drive::new("System Drive", "","C:\\", "", true, 320, 500, true),
+                        Drive::new("Data Drive", "","D:\\", "",true, 450, 1000, false),
+                        Drive::new("External Backup", "","E:\\", "",false, 1200, 2000, true),
                     ]
                 }
             ],
@@ -168,8 +169,8 @@ impl eframe::App for DriveManagerApp {
                     // Connect Drive button
                     let button_response = ui.add_sized(
                         [160.0, 40.0],
-                        egui::Button::new(RichText::new("+ Connect Drive").size(14.0))
-                            .fill(Color32::from_rgb(20, 20, 20))
+                        egui::Button::new(RichText::new("+ Connect Drive").size(14.0).color(Color32::WHITE))
+                            .fill( Color32::BLACK)
                             .stroke(Stroke::NONE)
                             .corner_radius(6.0)
                         //todo figure out how to disable
@@ -199,11 +200,10 @@ impl eframe::App for DriveManagerApp {
 
                             let disconnect_response = ui.add_sized(
                                 [160.0, 40.0],
-                                egui::Button::new(RichText::new("+ Discount ").size(14.0))
-                                    .fill(Color32::from_rgb(20, 20, 20))
+                                egui::Button::new(RichText::new("+ Disconnect ").size(14.0).color(Color32::WHITE))
+                                    .fill( Color32::BLACK)
                                     .stroke(Stroke::NONE)
                                     .corner_radius(6.0)
-
 
                             );
 
@@ -398,23 +398,31 @@ impl DriveManagerApp {
                         ui.label(RichText::new("Path").size(12.0).color(Color32::GRAY));
                         ui.add_space(5.0);
 
-                        egui::Frame::none()
-                            .fill(Color32::from_rgb(230, 230, 230))
-                            .corner_radius(6.0)
-                            .inner_margin(8.0)
-                            .show(ui, |ui| {
-                                if drive.mounted {
+                        if drive.mounted {
+                            egui::Frame::default()
+                                .fill(Color32::from_rgb(230, 230, 230))
+                                .corner_radius(6.0)
+                                .inner_margin(8.0)
+                                .show(ui, |ui| {
                                     ui.label(
                                         RichText::new(&drive.mount_path)
                                             .size(14.0)
                                     );
-                                } else {
+                                });
+                        } else {
+                            egui::Frame::default()
+                                .fill(Color32::WHITE)
+                                .corner_radius(6.0)
+                                .inner_margin(8.0)
+                                .show(ui, |ui| {
                                     ui.add(
                                         TextEdit::singleline(&mut drive.editable_mount)
                                             .font(egui::FontId::proportional(14.0))
+                                            .frame(false)
+                                            .text_color(Color32::BLACK)
                                     );
-                                }
-                            });
+                                });
+                        }
 
                         ui.add_space(20.0);
 
@@ -588,10 +596,27 @@ struct ConnectDriveDialog {
     password: String,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, Display)]
-pub(crate) enum ConnectionType {
+pub enum ConnectionType {
     #[default]
     Direct,
     Hub,
+}
+
+impl ConnectionType {
+    pub(crate) fn to_i32(&self) -> i32 {
+        match self {
+            ConnectionType::Direct => 0,
+            ConnectionType::Hub => 1,
+        }
+    }
+
+    pub(crate) fn from_i32(value: i32) -> anyhow::Result<Self> {
+        match value {
+            0 => Ok(ConnectionType::Direct),
+            1 => Ok(ConnectionType::Hub),
+            _ => Err(anyhow::anyhow!("Invalid connection type value: {}", value)),
+        }
+    }
 }
 
 impl ConnectDriveDialog {
@@ -692,8 +717,8 @@ impl ConnectDriveDialog {
                         ui.add_space(ui.available_width() - 80.0);
 
                         if ui.add_enabled(!is_loading && !self.system.is_empty() && !self.username.is_empty() && !self.password.is_empty(),
-                                          egui::Button::new("Connect")
-                                              .fill(Color32::from_rgb(20, 20, 20))
+                                          egui::Button::new(egui::RichText::new("Connect").color(Color32::WHITE))
+                                              .fill( Color32::BLACK)
                                               .min_size([80.0, 35.0].into())
                         ).clicked() {
 

@@ -10,6 +10,7 @@ mod filesystem;
 mod network;
 mod deamonize;
 mod driveManagerUI;
+mod autoRun;
 
 mod proto {
     pub mod vaultdrive {
