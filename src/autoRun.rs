@@ -97,14 +97,15 @@ pub fn insert(auto_run: auto_run) -> anyhow::Result<()> {
 pub fn remove(auto_run: auto_run) -> anyhow::Result<()> {
     let connection = get_connection()?;
 
-    let query = "DELETE FROM auto_run WHERE connection_type = ? AND connection_point = ? AND username = ?";
+    let query = "DELETE FROM auto_run WHERE connection_type = ? AND connection_point = ? AND username = ? AND host_drive = ?";
 
     connection.execute(
         query,
         rusqlite::params![
-            auto_run.connection_type.to_string(),
+            auto_run.connection_type.to_i32(),
             auto_run.connection_point,
-            auto_run.username
+            auto_run.username,
+            auto_run.host_drive,
         ],
     )?;
     let count = count()?;
@@ -146,8 +147,9 @@ pub fn create_table() -> anyhow::Result<()> {
             connection_type INTEGER NOT NULL CHECK(connection_type IN (0, 1)),
             connection_point TEXT NOT NULL,
             username TEXT NOT NULL,
-            drive TEXT NOT NULL
-            UNIQUE(connection_type, connection_point, username, host_drive, local_drive)
+            host_drive TEXT NOT NULL,
+            local_drive TEXT NOT NULL,
+            UNIQUE(connection_type, connection_point, username, host_drive)
         );
     ";
     connection.execute(query, [])?;

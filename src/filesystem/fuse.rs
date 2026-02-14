@@ -1274,7 +1274,7 @@ pub async fn mount(
     let session = fuser::spawn_mount2(fs, &mount_point, &options)
         .context("Failed to mount filesystem")?;
 
-    client.mounts.insert.insert(
+    client.mounts.insert(
         mount_point.clone(),
         (Arc::new(Mutex::new(session)), drive.to_string()),
     );

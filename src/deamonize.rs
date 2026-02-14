@@ -113,7 +113,12 @@ pub fn spawn_daemon() -> io::Result<()> {
     {
         spawn_daemon_windows()
     }
+
 }
+
+
+
+
 #[cfg(unix)]
 fn spawn_daemon_unix() -> io::Result<()> {
     use std::os::unix::process::CommandExt;

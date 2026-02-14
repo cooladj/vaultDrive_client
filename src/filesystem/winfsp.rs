@@ -1158,7 +1158,7 @@ pub async fn mount(client: Arc<VaultDriveClient>, mount_point: &str, drive: &str
 
 
 
-    if drive.is_empty(){
+    if mount_point.is_empty(){
         host.mount(MountPoint::NextFreeDrive).context("Failed to mount filesystem")?;
 
     }else {

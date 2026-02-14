@@ -36,6 +36,8 @@ pub struct VaultDriveClient {
     pub session: Arc<RwLock<Option<session>>>,
     pub server_addr: RwLock<SocketAddr>,
     pub mount_points: DashSet<String>,
+
+    ///local mount point , (mount thread handle, host mount point)
     pub mounts: DashMap<String, (MOUNT_TYPES, String)>
 
 }

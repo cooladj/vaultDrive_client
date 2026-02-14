@@ -18,7 +18,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use keyring::Entry;
 use rusqlite::fallible_iterator::FallibleIterator;
 use serde::{Deserialize, Serialize};
-use crate::autoRun::{auto_run, exists};
+use crate::autoRun::{auto_run, exists, insert, remove};
 use crate::client::{VAULT_DRIVE_MAP, VaultDriveClient};
 use crate::driveManagerUI::{Connection, ConnectionType, Drive};
 use crate::filesystem::{mount_to_UI_tuple};
@@ -54,6 +54,17 @@ pub enum SocketCommand {
         username:String,
         socketaddr: SocketAddr,
     },
+    AutoMount{
+        mount_point: String,
+        drive: String,
+        socketaddr: SocketAddr,
+        username: String,
+    },
+    UnAutoMount{
+        drive: String,
+        socketaddr: SocketAddr,
+        username: String,
+}
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ResponseData {
@@ -123,6 +134,18 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
             }
 
         }
+        SocketCommand::AutoMount {mount_point, drive,  username, socketaddr } => {
+            match execute_set_auto_mount(mount_point, socketaddr, username, drive).await {
+                Ok(_) => CommandResponse::Success(ResponseData::Empty),
+                Err(e) => CommandResponse::Error(e.to_string()),
+            }
+        },
+        SocketCommand::UnAutoMount {  drive,  username, socketaddr} => {
+            match execute_un_auto_mount(drive, socketaddr, username).await {
+                Ok(_) => CommandResponse::Success(ResponseData::Empty),
+                Err(e) => CommandResponse::Error(e.to_string()),
+            }
+        }
         SocketCommand::Disconnect {username, socketaddr} => {
 
             match execute_disconnect(username, socketaddr).await {
@@ -191,10 +214,65 @@ pub async fn execute_unmount(mount_point: String, server: SocketAddr, username:S
         .ok_or_else(|| anyhow!("Client not found"))?;
 
     let host = client.mounts
-        .remove(&mount_point)
-        .context("There is no mount");
-    drop(host);
+        .remove(&mount_point);
 
+    if let Some((_, (_, host_drive))) = host {
+        let (connection_type, connection_point) = client.session.read().await
+            .as_ref()
+            .and_then(|session| session.hostname.as_ref())
+            .map(|hostname| (ConnectionType::Hub, hostname.clone()))
+            .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
+
+        let auto_run = auto_run::new(
+            connection_type,
+            connection_point,
+            username,
+            host_drive,
+            "".to_string()
+        );
+
+        tokio::task::spawn_blocking(move || {
+            remove(auto_run).context(format!("Failed to remove auto-mount {:?}", mount_point));
+
+        }).await?;
+    }
+
+    Ok(())
+}
+pub async fn execute_set_auto_mount(mount_point: String, server: SocketAddr, username:String, drive: String) -> Result<()>{
+    let client = VAULT_DRIVE_MAP
+        .get(&(server, username.to_string()))
+        .map(|entry| entry.clone())
+        .ok_or_else(|| anyhow!("Client not found"))?;
+
+    let (connection_type, connection_point) = client.session.read().await
+        .as_ref()
+        .and_then(|session| session.hostname.as_ref())
+        .map(|hostname| (ConnectionType::Hub, hostname.clone()))
+        .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
+    
+    let auto_run = auto_run::new(connection_type, connection_point, username, drive, mount_point);
+    tokio::task::spawn_blocking(move || {
+        insert(auto_run).context(format!("Failed to remove auto-mount {:?}", connection_type));
+    }).await?;
+    Ok(())
+}
+
+pub async fn execute_un_auto_mount(drive:  String, server: SocketAddr, username:String) -> Result<()>{
+    let client = VAULT_DRIVE_MAP
+        .get(&(server, username.to_string()))
+        .map(|entry| entry.clone())
+        .ok_or_else(|| anyhow!("Client not found"))?;
+
+    let (connection_type, connection_point) = client.session.read().await
+        .as_ref()
+        .and_then(|session| session.hostname.as_ref())
+        .map(|hostname| (ConnectionType::Hub, hostname.clone()))
+        .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
+    let auto_run = auto_run::new(connection_type, connection_point, username, drive, "".to_string());
+    tokio::task::spawn_blocking(move || {
+        remove(auto_run).context(format!("Failed to remove auto-mount {:?}", connection_type));
+    }).await?;
     Ok(())
 }
 

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use strum_macros::{Display, EnumIter};
 use strum::IntoEnumIterator;
-use crate::autoRun::auto_run;
+
 
 pub async fn runUI() -> eframe::Result<()> {
     let connections =match send_command_to_daemon(
@@ -331,9 +331,9 @@ impl DriveManagerApp {
                          , width: f32)  {
 
         let connection = &mut self.connections[connection_idx];
+        let conn_clone = connection.clone();
         let ip_addr = connection.ip_addr;
         let username = connection.username.clone();
-        let connection_clone = connection.clone();
 
         // THEN borrow mutably
         let drive = &mut connection.drive[drive_idx];
@@ -470,18 +470,23 @@ impl DriveManagerApp {
 
                         ui.add_space(25.0);
 
-                        // Mount/Unmount button
-                        let button_text = if drive.mounted { "🔌 Unmount" } else { "🔌 Mount" };
-                        let button_color = if drive.mounted {
-                            Color32::from_rgb(250, 250, 250)
+                        let (button_text, button_color, text_color, stroke) = if drive.mounted {
+                            (
+                                "🔌 Unmount",
+                                Color32::from_rgb(250, 250, 250),
+                                Color32::BLACK,
+                                Stroke::new(1.0, Color32::from_rgb(200, 200, 200))
+                            )
                         } else {
-                            Color32::from_rgb(20, 20, 20)
+                            (
+                                "🔌 Mount",
+                                Color32::from_rgb(20, 20, 20),
+                                Color32::WHITE,
+                                Stroke::NONE
+                            )
                         };
-                        let text_color = if drive.mounted {
-                            Color32::BLACK
-                        } else {
-                            Color32::WHITE
-                        };
+
+                        ui.horizontal(|ui| {
 
                         let button_response = ui.add_enabled(
                             !mount_loading,
@@ -489,13 +494,76 @@ impl DriveManagerApp {
                                 .size(14.0)
                                 .color(text_color))
                                 .fill(button_color)
-                                .stroke(if drive.mounted {
-                                    Stroke::new(1.0, Color32::from_rgb(200, 200, 200))
-                                } else {
-                                    Stroke::NONE
-                                })
+                                .stroke(stroke)
                                 .corner_radius(6.0)
                         );
+                        if drive.mounted {
+
+                            let (button_color, button_text ) = if drive.auto_run{
+                                (Color32::RED, "Remove Auto Mount")
+                            }else {
+                                (Color32::GREEN, "Add Auto Mount")
+                            };
+
+                            let button_response = ui.add_enabled(
+                                !mount_loading,
+                                egui::Button::new(RichText::new(button_text)
+                                    .size(14.0)
+                                    .color(Color32::BLACK))
+                                    .fill(button_color)
+                                    .stroke(if drive.mounted {
+                                        Stroke::new(1.0, Color32::from_rgb(200, 200, 200))
+                                    } else {
+                                        Stroke::NONE
+                                    })
+                                    .corner_radius(6.0)
+                            );
+                            if button_response.clicked() {
+
+                               let command = match button_text {
+                                    "Remove Auto Mount" => {
+                                        SocketCommand:: UnAutoMount {
+                                            drive: drive.server_mount_point.clone(),
+                                            socketaddr: connection.ip_addr,
+                                            username: username.clone(),
+                                        }
+
+                                    }
+                                    "Add Auto Mount" => {
+                                        SocketCommand::AutoMount {
+                                            mount_point: drive.mount_path.clone(),
+                                            drive: drive.server_mount_point.clone(),
+                                            socketaddr: connection.ip_addr,
+                                            username: username.clone(),
+                                        }
+                                    }
+                                    _ => {
+                                        unreachable!()
+                                    }
+
+                                };
+                                let _ = self.connect_bind.read_or_request(|| {
+                                    async move {
+
+                                        match send_command_to_daemon(command).await {
+                                            Ok(_) => {
+                                                match send_command_to_daemon(SocketCommand::Volumes{
+                                                    connection:None
+                                                }).await {
+                                                    Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => {
+                                                        Ok(connections)
+                                                    }
+                                                    _ => { Ok(vec![]) }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                Err(e.to_string())
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
 
 
                         if button_response.clicked() {
@@ -505,7 +573,7 @@ impl DriveManagerApp {
                                         mount_point: drive.editable_mount.clone(),
                                         drive: drive.server_mount_point.clone(),
                                         socketaddr: ip_addr,
-                                        username,
+                                        username: username.clone(),
                                     }, Operation::MOUNT)
                                 }
                                 else {
@@ -527,7 +595,7 @@ impl DriveManagerApp {
                                     match send_command_to_daemon(socket_command).await {
                                         Ok(_) => {
                                             match send_command_to_daemon(SocketCommand::Volumes{
-                                                connection: Some(connection_clone),
+                                                connection: Some(conn_clone),
                                             }).await {
                                                 Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => {
                                                     Ok(connections)
@@ -541,6 +609,7 @@ impl DriveManagerApp {
                             });
 
                         }
+                    });
 
                     });
             });
