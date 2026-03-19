@@ -15,10 +15,7 @@ use fuser::{
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
     ReplyWrite, Request, TimeOrNow, FUSE_ROOT_ID,
 };
-use libc::{
-    EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY,
-    O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
-};
+use libc::{chown, EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Handle;
@@ -212,6 +209,7 @@ pub struct VirtualFileSystem {
     pending_dir_requests: Arc<DashMap<String, Arc<OnceCell<Vec<DirectoryEntry>>>>>,
     
     lookup_counts: Arc<DashMap<u64, u64>>,
+    scope: String,
 
 
     uid: u32,
@@ -287,6 +285,7 @@ impl VirtualFileSystem {
     }
 
     fn convert_open_flags(&self, flags: i32) -> u32 {
+
         let mut internal_flags: u32 = 0;
 
         let access_mode = flags & libc::O_ACCMODE;
@@ -1255,6 +1254,7 @@ pub async fn mount(
     client: Arc<VaultDriveClient>,
     mount_point: &str,
     drive: &str,
+    scope: Arc<RwLock<String>>
 ) -> Result<()> {
     info!("Mounting VaultDrive at {}", mount_point);
 
@@ -1276,7 +1276,7 @@ pub async fn mount(
 
     client.mounts.insert(
         mount_point.clone(),
-        (Arc::new(Mutex::new(session)), drive.to_string()),
+        (Arc::new(Mutex::new(session)), drive.to_string(), scope),
     );
     client.mount_points.insert(mount_point.clone());
 

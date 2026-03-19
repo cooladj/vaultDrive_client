@@ -4,17 +4,18 @@ use eframe::egui;
 use egui_async::{EguiAsyncPlugin, Bind};
 use egui::{Color32, ComboBox, CornerRadius, Margin, RichText, Sense, Stroke, TextEdit, Vec2, Window};
 use std::net::SocketAddr;
-use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 use strum_macros::{Display, EnumIter};
 use strum::IntoEnumIterator;
-
+use crate::shared::{elevated, get_user_id};
 
 pub async fn runUI() -> eframe::Result<()> {
     let connections =match send_command_to_daemon(
         SocketCommand::Volumes {
+            user_id: get_user_id().unwrap_or_default(),
             connection: None,
+            elevated: elevated()
         }
     ).await{
         Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => {
@@ -66,14 +67,14 @@ pub struct Drive {
     mounted: bool,
     used_space_gb: u64,
     total_space_gb: u64,
-    auto_run: bool,
+    scope: String,
 
     editable_mount: String,
     editable_sync: String,
 }
 
 impl Drive {
-    pub fn new(name: &str, server_mount_point: &str, mount_path: &str, sync_path: &str,mounted: bool, used_gb: u64, total_gb: u64, auto_run: bool) -> Self {
+    pub fn new(name: &str, server_mount_point: &str, mount_path: &str, sync_path: &str,mounted: bool, used_gb: u64, total_gb: u64, scope: String) -> Self {
         Self {
             name: name.to_string(),
             server_mount_point: server_mount_point.to_string(),
@@ -84,7 +85,7 @@ impl Drive {
             total_space_gb: total_gb,
             editable_mount: String::default(),
             editable_sync:String::default(),
-            auto_run
+            scope
         }
     }
 
@@ -127,9 +128,9 @@ impl Default for DriveManagerApp {
                     username: "Jimmy".to_string(),
                     host_name: "JimmyDesktop".to_string(),
                     drive: vec![
-                        Drive::new("System Drive", "","C:\\", "", true, 320, 500, true),
-                        Drive::new("Data Drive", "","D:\\", "",true, 450, 1000, false),
-                        Drive::new("External Backup", "","E:\\", "",false, 1200, 2000, true),
+                        Drive::new("System Drive", "","C:\\", "", true, 320, 500, "".to_string()),
+                        Drive::new("Data Drive", "","D:\\", "",true, 450, 1000, "".to_string()),
+                        Drive::new("External Backup", "","E:\\", "",false, 1200, 2000, "".to_string()),
                     ]
                 }
             ],
@@ -220,7 +221,9 @@ impl eframe::App for DriveManagerApp {
                                         ).await {
                                             Ok(_) => {
                                                 match send_command_to_daemon(SocketCommand::Volumes{
-                                                    connection:None
+                                                    user_id: get_user_id().unwrap_or_default(),
+                                                    connection:None,
+                                                    elevated: elevated()
                                                 }).await {
                                                     Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => {
                                                         Ok(connections)
@@ -269,23 +272,19 @@ impl eframe::App for DriveManagerApp {
                 let _ = self.connect_bind.read_or_request(|| {
                     async move {
 
-                        let service = format!("vaultDrive|{}|{}",
-                                              form_data.connection_type,
-                                              form_data.system
-                        );
-                        let entry = Entry::new(&service, form_data.username.as_str()).map_err(
-                            |e| e.to_string())?;
-
-                        entry.set_password(form_data.password.as_str())
-                            .map_err(|e| e.to_string())?;
                         match send_command_to_daemon(SocketCommand::Connect {
                             connection_type: form_data.connection_type,
                             connection_point: form_data.system,
                             username: form_data.username,
+                            password: form_data.password,
+                            scope_type: form_data.scope_type,
                         }).await {
                             Ok(_) => {
                                 match send_command_to_daemon(SocketCommand::Volumes{
-                                    connection:None
+                                    user_id: get_user_id().unwrap_or_default() ,
+                                    connection:None,
+                                    elevated: elevated()
+
                                 }).await {
                                     Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => {
                                         Ok(connections)
@@ -497,16 +496,15 @@ impl DriveManagerApp {
                                 .stroke(stroke)
                                 .corner_radius(6.0)
                         );
-                        if drive.mounted {
 
-                            let (button_color, button_text ) = if drive.auto_run{
-                                (Color32::RED, "Remove Auto Mount")
+                            let (button_color, button_text ) = if drive.scope.is_empty() {
+                                (Color32::GREEN, "All User")
                             }else {
-                                (Color32::GREEN, "Add Auto Mount")
+                                (Color32::WHITE, "Current User")
                             };
 
-                            let button_response = ui.add_enabled(
-                                !mount_loading,
+                            let scope_button_response = ui.add_enabled(
+                                !mount_loading || !elevated(),
                                 egui::Button::new(RichText::new(button_text)
                                     .size(14.0)
                                     .color(Color32::BLACK))
@@ -518,52 +516,54 @@ impl DriveManagerApp {
                                     })
                                     .corner_radius(6.0)
                             );
-                            if button_response.clicked() {
-
-                               let command = match button_text {
-                                    "Remove Auto Mount" => {
-                                        SocketCommand:: UnAutoMount {
-                                            drive: drive.server_mount_point.clone(),
-                                            socketaddr: connection.ip_addr,
-                                            username: username.clone(),
-                                        }
-
-                                    }
-                                    "Add Auto Mount" => {
-                                        SocketCommand::AutoMount {
-                                            mount_point: drive.mount_path.clone(),
-                                            drive: drive.server_mount_point.clone(),
-                                            socketaddr: connection.ip_addr,
-                                            username: username.clone(),
-                                        }
-                                    }
-                                    _ => {
-                                        unreachable!()
-                                    }
-
+                            if scope_button_response.clicked()  {
+                                drive.scope = if drive.scope.is_empty() {
+                                    get_user_id().unwrap_or_default()
+                                } else {
+                                    String::new()
                                 };
-                                let _ = self.connect_bind.read_or_request(|| {
-                                    async move {
+                                if drive.mounted {
+                                    let socketaddr = connection.ip_addr.clone();
+                                    let mount_path = drive.mount_path.clone();
+                                    let username = username.clone();
+                                    let scope = drive.scope.clone();
 
-                                        match send_command_to_daemon(command).await {
-                                            Ok(_) => {
-                                                match send_command_to_daemon(SocketCommand::Volumes{
-                                                    connection:None
-                                                }).await {
-                                                    Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => {
-                                                        Ok(connections)
+
+                                    let _ = self.connect_bind.read_or_request(|| {
+                                        async move {
+
+
+                                            match send_command_to_daemon(SocketCommand::Scope {
+                                                scope,
+                                                username,
+                                                socketaddr,
+                                                mount_point: mount_path,
+                                            })
+                                                .await
+                                            {
+                                                Ok(_) => {
+                                                    match send_command_to_daemon(SocketCommand::Volumes {
+                                                        user_id: get_user_id().unwrap_or_default(),
+                                                        connection: None,
+                                                        elevated: elevated(),
+                                                    })
+                                                        .await
+                                                    {
+                                                        Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => {
+                                                            Ok(connections)
+                                                        }
+                                                        _ => Ok(vec![]),
                                                     }
-                                                    _ => { Ok(vec![]) }
                                                 }
-                                            }
-                                            Err(e) => {
-                                                Err(e.to_string())
+                                                Err(e) => Err(e.to_string()),
                                             }
                                         }
-                                    }
-                                });
+                                    });
+                                }
+
+
                             }
-                        }
+
 
 
                         if button_response.clicked() {
@@ -574,6 +574,7 @@ impl DriveManagerApp {
                                         drive: drive.server_mount_point.clone(),
                                         socketaddr: ip_addr,
                                         username: username.clone(),
+                                        scope: drive.scope.clone(),
                                     }, Operation::MOUNT)
                                 }
                                 else {
@@ -595,7 +596,9 @@ impl DriveManagerApp {
                                     match send_command_to_daemon(socket_command).await {
                                         Ok(_) => {
                                             match send_command_to_daemon(SocketCommand::Volumes{
+                                                user_id: get_user_id().unwrap_or_default(),
                                                 connection: Some(conn_clone),
+                                                elevated: elevated()
                                             }).await {
                                                 Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => {
                                                     Ok(connections)
@@ -655,11 +658,13 @@ struct FormData {
     system: String,
     username: String,
     password: String,
+    scope_type: ScopeType
 }
 #[derive(Default)]
 struct ConnectDriveDialog {
     open: bool,
     connection_type: ConnectionType,
+    scope: ScopeType,
     system: String,
     username: String,
     password: String,
@@ -671,7 +676,25 @@ pub enum ConnectionType {
     Hub,
 }
 
-impl ConnectionType {
+impl Default for ScopeType {
+    fn default() -> Self {
+        ScopeType::CurrentUser(get_user_id().unwrap_or_default())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Display)]
+pub enum ScopeType {
+    #[strum(to_string = "{0}")]
+    CurrentUser(String),
+    #[strum(to_string = "")]
+    All,
+}
+
+
+
+
+
+
+        impl ConnectionType {
     pub(crate) fn to_i32(&self) -> i32 {
         match self {
             ConnectionType::Direct => 0,
@@ -706,6 +729,23 @@ impl ConnectDriveDialog {
                         ui.label(RichText::new("Add a network or remote drive to access files from other systems")
                             .color(Color32::GRAY));
                         ui.add_space(15.0);
+
+                        ui.add_enabled_ui(elevated(), |ui| {
+                            ui.label("Scope");
+                            ui.add_space(5.0);
+                            ComboBox::from_id_salt("scope")
+                                .selected_text(match self.scope {
+
+                                    ScopeType::CurrentUser(_) => "Current User",
+                                    ScopeType::All => "All Users",
+                                })
+                                .width(ui.available_width())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.scope, ScopeType::default(), "Current User");
+                                    ui.selectable_value(&mut self.scope, ScopeType::All, "All Users");
+                                });
+                        });
+
 
                         // Connection Type
                         ui.label("Connection Type");
@@ -795,7 +835,8 @@ impl ConnectDriveDialog {
                                 connection_type: self.connection_type,
                                 system: self.system.clone(),
                                 username: self.username.clone(),
-                                password: self.password.clone()
+                                password: self.password.clone(),
+                                scope_type: self.scope.clone(),
 
 
                             });

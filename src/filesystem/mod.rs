@@ -5,6 +5,7 @@ use crate::client::VaultDriveClient;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::collections::VecDeque;
+use parking_lot::RwLock;
 
 #[cfg(target_os = "windows")]
 pub mod winfsp;
@@ -16,15 +17,17 @@ pub async fn mount(
     client: Arc<VaultDriveClient>,
     mount_point: &str,
     drive: &str,
+    scope: String,
 ) -> Result<()> {
+    let scope = Arc::new(RwLock::new(scope));
     #[cfg(target_os = "windows")]
     {
-        let mount = winfsp::mount(client.clone(), mount_point, drive).await?;
+        let mount = winfsp::mount(client.clone(), &mut mount_point.to_string(), drive, scope).await?;
     }
 
     #[cfg(unix)]
     {
-        let mount = fuse::mount(client.clone(), mount_point, drive).await?;
+        let mount = fuse::mount(client.clone(), mount_point, drive, scope).await?;
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -48,7 +51,7 @@ pub async fn mount_to_UI_tuple(client: Arc<VaultDriveClient> ) -> Result<Vec<(Ar
         let results: Vec<(Arc<str>, Arc<str>)> = client.mounts
             .iter()
             .map(|entry| {
-                let (k, (_, label)) = entry.pair();
+                let (k, (_, label, _)) = entry.pair();
                 (Arc::<str>::from(k.as_str()), Arc::<str>::from(label.as_str()))
             })
             .collect();

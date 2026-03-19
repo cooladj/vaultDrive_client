@@ -9,6 +9,7 @@ use std::future::Future;
 use std::mem;
 use std::ops::Deref;
 use std::path::Path;
+use std::thread::Scope;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use parking_lot::{RwLock, Mutex};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
@@ -23,12 +24,12 @@ use strum_macros::Display;
 use tokio::runtime::{Handle};
 use tokio::sync::oneshot::error::RecvError;
 use tracing::{info, warn, Instrument};
-use windows::core::HSTRING;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{LocalFree, HLOCAL, STATUS_OBJECT_NAME_NOT_FOUND,STATUS_NOT_A_DIRECTORY, STATUS_INTERNAL_ERROR};
-use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT};
 
-use windows::Win32::Security::{InitializeSecurityDescriptor, SetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR,};
-use windows::Win32::Storage::FileSystem::{FILE_APPEND_DATA, FILE_FLAG_DELETE_ON_CLOSE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA};
+use windows::Win32::Security::{InitializeSecurityDescriptor, SetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR};
+use windows::Win32::Storage::FileSystem::{GetLogicalDrives, FILE_APPEND_DATA, FILE_FLAG_DELETE_ON_CLOSE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA};
 use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use crate::client::VaultDriveClient;
 use crate::proto::vaultdrive::{DirectoryEntry, FileInfoResponse};
@@ -83,7 +84,8 @@ struct FileNode {
 }
 
 impl FileNode {
-    fn create_custom_security_descriptor(&self) -> Result<Vec<u8>, FspError> {
+    fn create_custom_security_descriptor(&self, scope: String) -> Result<Vec<u8>, FspError> {
+
         debug!("Creating a custom security descriptor for flags: {}", self.flags);
         let mut access_mask = 0u32;
 
@@ -114,11 +116,15 @@ impl FileNode {
         }
 
         let sddl = if access_mask == 0 {
-            // No permissions - deny all
-            HSTRING::from("O:BAG:BAD:(D;;FA;;;WD)")
+            if !scope.is_empty() {
+                HSTRING::from(format!("O:{}G:BAD:(D;;FA;;;WD)", scope))
+            } else {
+                HSTRING::from("O:BAG:BAD:(D;;FA;;;WD)")
+            }
+        } else if !scope.is_empty() {
+            HSTRING::from(format!("O:{}G:BAD:(A;;0x{:08x};;;{})", scope, access_mask, scope))
         } else {
-            // Grant specified permissions to Everyone
-            HSTRING::from(&format!("O:BAG:BAD:(A;;0x{:08x};;;WD)", access_mask))
+            HSTRING::from(format!("O:BAG:BAD:(A;;0x{:08x};;;WD)", access_mask))
         };
 
         let mut psd = PSECURITY_DESCRIPTOR::default();
@@ -218,7 +224,9 @@ pub struct VirtualFileSystem {
     pending_file_requests: DashMap<String, Arc<PendingRequest>>,
     pending_dir_requests: Arc<DashMap<String, Arc<OnceCell<Vec<DirectoryEntry>>>>>,
 
-    drive: Arc<RwLock<String>>,
+    scope: Arc<RwLock<String>>,
+
+    drive: Arc<String>,
 }
 struct PendingRequest {
     result: OnceCell<Result<FileNode, i32>>,
@@ -228,7 +236,8 @@ impl VirtualFileSystem {
     pub fn new(
         client: Arc<VaultDriveClient>,
         handle: Handle,
-        drive: &str,
+        drive: String,
+        scope: Arc<RwLock<String>>,
     ) -> Self {
         Self {
 
@@ -238,7 +247,8 @@ impl VirtualFileSystem {
             next_context: Arc::new(InodeAllocator::new(1)),
             pending_file_requests: (DashMap::new()),
             pending_dir_requests: Arc::new(DashMap::new()),
-            drive: Arc::new(RwLock::new(drive.to_string())),
+            scope,
+            drive: Arc::new(drive),
         }
     }
 
@@ -360,7 +370,7 @@ impl FileSystemContext for VirtualFileSystem {
 
 
 
-        let sd = node.create_custom_security_descriptor()?;
+        let sd = node.create_custom_security_descriptor(self.scope.read().clone())?;
         let sd_size = sd.len() as u64;
 
         if let Some(buffer) = security_descriptor {
@@ -821,7 +831,7 @@ impl FileSystemContext for VirtualFileSystem {
         let node=rx.blocking_recv().map_err(|_| FspError::from(NTSTATUS(STATUS_NOT_FOUND)))??;
 
 
-        let sd = node.create_custom_security_descriptor()?;
+        let sd = node.create_custom_security_descriptor(self.scope.read().clone())?;
         let sd_size = sd.len() as u64;
 
         if let Some(buffer) = security_descriptor {
@@ -905,7 +915,7 @@ impl FileSystemContext for VirtualFileSystem {
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> Result<(), FspError> {
         debug!("get_volume_info called");
 
-        let label = self.drive.read().clone();
+        let label = self.drive.clone();
         let client = self.client.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -1129,18 +1139,19 @@ impl AsyncFileSystemContext for VirtualFileSystem {
 }
 
 
-
-
-///todo add support for chosoing a random drive, Problem now if a random letter is choose, I have no idea have to accuractly get said info
-/// probably should read though winfsp-sys call to see otherwise query mount before, than after and see difference
-pub async fn mount(client: Arc<VaultDriveClient>, mount_point: &str, drive: &str) -> anyhow::Result<()> {
+pub async fn mount(client: Arc<VaultDriveClient>, mount_point: &mut String, drive: &str, scope: Arc<RwLock<String>>) -> anyhow::Result<()> {
+    if mount_point.is_empty() {
+        *mount_point = next_free_drive().context("No free drive letters available")?;
+    }
     tracing::info!("Mounting VaultDrive at {}", mount_point);
 
-    let mount_point = normalize_mount_point(mount_point)?;
+    let mut mount_point = normalize_mount_point(mount_point)?;
     let handle = Handle::current();
-    let fs = VirtualFileSystem::new(client.clone(),  handle, drive);
+    let fs = VirtualFileSystem::new(client.clone(),  handle, drive.to_string(), scope.clone());
+    
 
     let mut volume_params = VolumeParams::new();
+    volume_params.filesystem_name("VaultDrive");
     volume_params.sector_size(512);
     volume_params.sectors_per_allocation_unit(1);
     volume_params.volume_creation_time(system_time_to_filetime(std::time::SystemTime::now()));
@@ -1151,29 +1162,28 @@ pub async fn mount(client: Arc<VaultDriveClient>, mount_point: &str, drive: &str
     tracing::info!("Creating FileSystemHost...");
 
     let mut host = FileSystemHost::<VirtualFileSystem>::new_async(volume_params, fs)
+        .inspect_err(|e| tracing::error!("Mount failed: {:?}", e))
         .context("Failed to create filesystem host")?;
 
 
     tracing::info!("Mounting filesystem at {}", mount_point);
 
-
-
-    if mount_point.is_empty(){
-        host.mount(MountPoint::NextFreeDrive).context("Failed to mount filesystem")?;
-
-    }else {
-        host.mount(&mount_point).context("Failed to mount filesystem")?;
-
-    }
+    host.mount(&mount_point).context("Failed to mount filesystem")?;
 
     tracing::info!("Starting dispatcher threads...");
     host.start().context("Failed to start FSP dispatcher")?;
-    client.mounts.insert(mount_point.clone(), (Mutex::new(host), drive.to_string()));
-    client.mount_points.insert(mount_point.clone());
-
+    client.mounts.insert(mount_point.clone(), (Mutex::new(host), drive.to_string(), scope));
 
 
     Ok(())
+}
+
+fn next_free_drive() -> Option<String> {
+    let used = unsafe { GetLogicalDrives() };
+    (0..26u32)
+        .rev()
+        .find(|&i| used & (1 << i) == 0)
+        .map(|i| format!("{}:", (b'A' + i as u8) as char))
 }
 
 

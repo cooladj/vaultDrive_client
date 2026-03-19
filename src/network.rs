@@ -35,7 +35,7 @@ pub(crate) const ZERO_ADDR: SocketAddr = SocketAddr::new(
 );
 
 ///This is currently turned off
-const DEFAULT_HUB_DNS: &str = "vaultdrive.org";
+const DEFAULT_HUB_DNS: &str = "hub.vaultdrive.org:8443";
 
 
 static QUIC_CLIENT: OnceCell<QuicClient> = OnceCell::const_new();
@@ -190,12 +190,9 @@ impl QuicClient {
                     .expect("Client not found")
                     .clone();
 
-                let session = client.session.read().await
-                    .as_ref()
-                    .expect("Session is None")
-                    .clone(); // Clone the Session itself
 
-                client.renew_connection(session).await
+
+                client.renew_connection().await
 
             })
                 .await;
@@ -303,7 +300,7 @@ impl rustls::client::danger::ServerCertVerifier for VaultDriveServerVerifier {
                     ))?;
 
                 // Verify CN matches expected value for self-signed
-                if subject_cn != "vaultDriveServer" && subject_cn != "vaultDriveHub" {
+                if subject_cn != "vaultDriveServer" {
                     tracing::error!(
                         "Certificate verification failed: CA validation failed and CN mismatch (expected 'vaultDriveServer', got '{}')",
                         subject_cn
@@ -363,17 +360,12 @@ impl rustls::client::danger::ServerCertVerifier for VaultDriveServerVerifier {
 
 pub async fn write_message<T: Message>(send: &mut SendStream, msg: &T) -> Result<()> {
     let mut buf = BytesMut::new();
-    msg.encode(&mut buf)
-        .context("Failed to encode message")?;
+    msg.encode(&mut buf).context("Failed to encode message")?;
 
-    let len = buf.len() as u32;
-    let mut frame = BytesMut::with_capacity(4 + buf.len());
-    frame.put_u32(len);
-    frame.put(buf);
-
-    send.write_all(&frame).await
-        .context("Failed to write message")?;
+    send.write_u32(buf.len() as u32).await.context("Failed to write length")?;
+    send.write_all(&buf).await.context("Failed to write message")?;
     send.flush().await.context("Failed to flush message")?;
+
 
     Ok(())
 }

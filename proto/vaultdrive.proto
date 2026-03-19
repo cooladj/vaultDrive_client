@@ -19,12 +19,13 @@ message Request {
     GetFileInfoRequest get_file_info = 9;
     ListVolumesRequest list_volumes = 10;
     GetVolumeInfoRequest get_volume_info = 11;
-    Watch watch= 12;
     OpenFileRequest open_file = 13;
     LockRequest lock_file = 14;
     CreateFileRequest create_file = 15;
     CloseFileRequest close_file = 16;
     OverrideFileRequest override_file = 17;
+    ReAuthenticateRequest reauthenticate = 18;
+    RemoveRequest remove = 19;
   }
 }
 
@@ -43,7 +44,7 @@ message Response {
     VolumeListResponse volume_list = 7;
     VolumeInfoResponse volume_info = 8;
     ErrorResponse error = 9;
-    Watch watch = 10;
+
   }
 }
 
@@ -54,6 +55,16 @@ message Response {
 message AuthenticateRequest {
   string username = 1;
   string password = 2;
+  string connection_id = 3;
+  bytes key = 4;
+}
+message RemoveRequest{
+  string connection_id = 1;
+}
+
+message ReAuthenticateRequest{
+  string connection_id = 1;
+  bytes key = 2;
 }
 
 message CloseFileRequest{
@@ -202,11 +213,6 @@ message VolumeInfo {
   string root_path = 3;
   uint64 total_size = 4;
   uint64 available_space = 5;
-}
-
-message Watch{
-  string drive = 1;
-  repeated  string path = 2;
 }
 
 

@@ -1,257 +1,235 @@
 ﻿use std::{env, io, process};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::net::SocketAddr;
+use std::str::FromStr;
+use std::thread::scope;
 use futures::{SinkExt, StreamExt, TryFutureExt};
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName, };
 use interprocess::local_socket::traits::tokio::{Listener, };
 use log::{debug, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use crate::autoRun::{auto_run, create_table, get_auto_run};
-use crate::commands::{execute_socket_command, CommandResponse, ResponseData, SocketCommand};
-
+use service_manager::*;
+use crate::autoRun::{init_db, get_connections_with_mounts};
+use crate::client::VaultDriveClient;
+use crate::commands::{connectionDirect, connectionHub, execute_socket_command, CommandResponse, ResponseData, SocketCommand};
+use crate::driveManagerUI::ConnectionType;
+use crate::network::ZERO_ADDR;
+pub const SERVICE_NAME: &str = "com.vaultDrive_client.service";
 pub fn is_daemon_process() -> bool {
-    std::env::var("IS_DAEMON").is_ok()
+   if  std::env::var("IS_DAEMON").is_ok() || std::env::args().any(|arg| arg == "--service"){
+       return true;
+   }
+    false
+
+}
+
+fn start_service() -> io::Result<()> {
+    let label: ServiceLabel = ServiceLabel::from_str(SERVICE_NAME)?;
+
+    // Get generic service by detecting what is available on the platform
+    let manager = <dyn ServiceManager>::native()?;
+
+    let exe_path = std::env::current_exe()?;
+    debug!("{:?}", exe_path);
+
+
+
+
+
+    if  service_status()? == ServiceStatus::NotInstalled {
+
+        let username = if cfg!(windows) {
+            Some("NT AUTHORITY\\NetworkService".to_string())
+        } else {
+            None
+        };
+
+        info!("service is not installed, Installing...");
+        manager.install(ServiceInstallCtx {
+            label: label.clone(),
+            program: exe_path,
+            args: vec![OsString::from("--service")],
+            contents: None,
+             username,
+            working_directory: Some(std::env::current_dir()?),
+            environment: Some(vec![
+                ("IS_DAEMON".to_string(), "1".to_string()),
+                ("IS_SERVICE".to_string(), "1".to_string()),
+            ]), // Optional list of environment variables to supply the service process.
+            autostart: true,
+            restart_policy: RestartPolicy::default(),
+        })?;
+    }
+
+    if service_status()? != ServiceStatus::Running {
+        info!("service is not running, Running...");
+        // Start our service using the underlying service management platform
+        match manager.start(ServiceStartCtx {
+            label: label.clone()
+        }) {
+            Ok(_) => {
+                info!("service is now running");
+                Ok(())},
+            Err(err) => {debug!("There was an error thrown on start {:?}", err);
+                Err(err)
+
+            },
+        }
+    }else {
+        info!("service is already running");
+        Ok(())
+    }
+}
+
+fn stop_service() -> io::Result<()> {
+    info!("stopping service");
+    let label: ServiceLabel = ServiceLabel::from_str(SERVICE_NAME)?;
+    let manager = <dyn ServiceManager>::native()
+        .expect("Failed to detect management platform");
+    manager.stop(ServiceStopCtx {
+        label: label.clone()
+    })
+
+}
+fn uninstall_service() -> io::Result<()> {
+    info!("uninstalling service");
+    let label: ServiceLabel = ServiceLabel::from_str(SERVICE_NAME)?;
+    let manager = <dyn ServiceManager>::native()
+        .expect("Failed to detect management platform");
+    manager.uninstall(ServiceUninstallCtx {
+        label: label.clone()
+    })
+}
+fn service_manager_available() -> bool {
+    let service_manager = match <dyn ServiceManager>::native() {
+        Ok(sm) => sm,
+        Err(_) => return false,
+    };
+
+    service_manager.available().unwrap_or(false)
+}
+fn service_status() -> std::io::Result<ServiceStatus> {
+    let label: ServiceLabel = ServiceLabel::from_str(SERVICE_NAME)?;
+    let manager = <dyn ServiceManager>::native()?;
+
+    manager.status(ServiceStatusCtx {
+        label: label.clone()
+    })
 }
 
 pub fn is_daemon_running() -> io::Result<bool> {
-    let pid_file = get_pid_file_path();
+    match service_status(){
+        Ok(status) => {
+            match status {
+                ServiceStatus::Running => { Ok(true) },
+                _ => Ok(false)
+            }
 
-    let pid_str = match std::fs::read_to_string(&pid_file) {
-        Ok(content) => content,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Ok(false); 
         }
-        Err(e) => return Err(e),
-    };
-
-    let pid: u32 = match pid_str.trim().parse() {
-        Ok(p) => p,
-        Err(_) => return Ok(false), 
-    };
-
-    Ok(check_process_running(pid))
+        _ => {Ok(false)}
+    }
 }
-
 
 pub async fn restart_process_daemon() -> io::Result<()> {
-    let pid_file = get_pid_file_path();
+    match service_status() {
+        Ok(status) => {
+            match status {
+                ServiceStatus::NotInstalled => {
+                    if !service_manager_available() {
+                        info!("Unable to start daemon as a service ");
 
-    let pid_str = match tokio::fs::read_to_string(&pid_file).await {
-        Ok(content) => content,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return spawn_daemon();
-        }
-        Err(e) => return Err(e),
-    };
+                    }
 
-    let pid: u32 = match pid_str.trim().parse() {
-        Ok(p) => p,
-        Err(_) => return spawn_daemon(),
-    };
+                    start_service()
 
-    let pid_file_clone = pid_file.clone();
-
-    tokio::task::spawn_blocking(move || -> io::Result<()> {
-        kill_process_by_pid(pid).ok();
-        std::fs::remove_file(&pid_file_clone).ok();
-        Ok(())
-    })
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
-
-    spawn_daemon()
-}
-
-fn kill_process_by_pid(pid: u32) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        use nix::sys::wait::waitpid;
-
-        kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let _ = waitpid(Pid::from_raw(pid as i32), None);
-    }
-
-    #[cfg(windows)]
-    {
-        use windows::Win32::System::Threading::{
-            OpenProcess, TerminateProcess, WaitForSingleObject,
-            PROCESS_TERMINATE, PROCESS_SYNCHRONIZE
-        };
-        use windows::Win32::Foundation::{CloseHandle, HANDLE};
-
-        unsafe {
-            let handle: HANDLE = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-            let result = (|| {
-                TerminateProcess(handle, 0)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                WaitForSingleObject(handle, u32::MAX);
-                Ok::<(), io::Error>(())
-            })();
-
-            CloseHandle(handle).ok();
-            result?;
-        }
-    }
-
-    Ok(())
-}
-
-
-pub fn spawn_daemon() -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        spawn_daemon_unix()
-    }
-
-    #[cfg(windows)]
-    {
-        spawn_daemon_windows()
-    }
-
-}
-
-
-
-
-#[cfg(unix)]
-fn spawn_daemon_unix() -> io::Result<()> {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    let temp_file = get_daemon_log_file();
-
-    let child = Command::new(std::env::current_exe()?)
-        .env("IS_DAEMON", "1")
-        .stdin(Stdio::null())
-        .stdout(temp_file.as_ref().map_or(Stdio::inherit(), |f| Stdio::from(f.try_clone().unwrap())))
-        .stderr(temp_file.map_or(Stdio::inherit(), Stdio::from))
-        .process_group(0)
-        .spawn()?;
-
-    // Write PID file
-    let pid = child.id();
-    std::fs::write(get_pid_file_path(), pid.to_string())?;
-
-    Ok(())
-}
-
-fn get_daemon_log_file() -> io::Result<File> {
-    let temp_dir = env::temp_dir();
-    debug!("the daemon log are going here {:?}",temp_dir );
-    OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(temp_dir.join("vaultDrive_daemon.log"))
-}
-
-#[cfg(windows)]
-fn spawn_daemon_windows() -> io::Result<()> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    const DETACHED_PROCESS: u32 = 0x00000008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-
-    let temp_file = get_daemon_log_file();
-
-    let child = Command::new(std::env::current_exe()?)
-        .env("IS_DAEMON", "1")
-        .stdin(Stdio::null())
-        .stdout(temp_file.as_ref().map_or(Stdio::inherit(), |f| Stdio::from(f.try_clone().unwrap())))
-        .stderr(temp_file.map_or(Stdio::inherit(), Stdio::from))
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .spawn()?;
-
-    // Write PID file
-    let pid = child.id();
-    std::fs::write(get_pid_file_path(), pid.to_string())?;
-
-    Ok(())
-}
-
-fn check_process_running(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-
-    #[cfg(windows)]
-    {
-        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-
-        unsafe {
-             match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid){
-                Ok(_) => {  true}
-                Err(_) => {  false }
+                }
+                ServiceStatus::Running => {
+                    stop_service()?;
+                    start_service()
+                }
+                ServiceStatus::Stopped(_) => {
+                    start_service()
+                }
             }
         }
+        Err(e) => Err(e)
     }
 }
 
-fn get_pid_file_path() -> String {
-    #[cfg(unix)]
-    {
-        "/tmp/vaultdrive.pid".to_string()
-    }
-
-    #[cfg(windows)]
-    {
-        format!("{}\\vaultdrive.pid",
-                std::env::var("TEMP").unwrap_or_else(|_| "C:\\Temp".to_string()))
-    }
-}
 
 pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
-    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
-    {
-        tokio::spawn(async {
-            let auto = match tokio::task::spawn_blocking(|| {
-                create_table().ok()?;
-                get_auto_run().ok()
-            })
-                .await
-            {
-                Ok(Some(entries)) => entries,
-                _ => return,
-            };
 
-            for x in auto {
-                tokio::spawn(async move {
-                    let conn_command = SocketCommand::Connect {
-                        connection_type: x.connection_type,
-                        connection_point: x.connection_point.clone(),
-                        username: x.username.clone(),
-                    };
+    tokio::spawn(async {
+        init_db().await.ok();
 
-                    match execute_socket_command(conn_command).await {
-                        CommandResponse::Success(ResponseData::Text(s)) => {
-                            let Ok(socketaddr) = s.parse::<std::net::SocketAddr>() else {
-                                return;
-                            };
+        let connections = match get_connections_with_mounts().await {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
 
-                            let mount_command = SocketCommand::Mount {
-                                mount_point: x.mount_point,  
-                                drive: x.host_drive,
-                                socketaddr,
-                                username: x.username,
-                            };
-
-                            execute_socket_command(mount_command).await;
+        for connection in connections {
+            tokio::spawn(async move {
+                let client = if connection.connection_type == ConnectionType::Direct {
+                    let socket_addr: SocketAddr = match connection.connection_point.parse() {
+                        Ok(socket) => socket,
+                        Err(e) => {
+                            tracing::error!("Failed to parse socket address: {}", e);
+                            return;
                         }
-                        _ => return,
                     };
-                });
-            }
-        });
-    }
+                    match VaultDriveClient::new(socket_addr, connection.username, connection.scope).await {
+                        Ok(client) => client,
+                        Err(e) => {
+                            tracing::error!("Failed to create client: {}", e);
+                            return;
+                        }
+                    }
+                } else {
+                    let default_socket_addr: SocketAddr = ZERO_ADDR;
+                    let client = match VaultDriveClient::new(default_socket_addr, connection.username, connection.scope).await {
+                        Ok(client) => client,
+                        Err(e) => {
+                            tracing::error!("Failed to create hub client: {}", e);
+                            return;
+                        }
+                    };
+                    if let Err(e) = client.connect_to_hub(connection.connection_point.as_str()).await {
+                        tracing::error!("Failed to connect to hub: {}", e);
+                        return;
+                    }
+                    client
+                };
+
+                let session = client.session.read().await
+                    .as_ref()
+                    .expect("Session is None")
+                    .clone();
+
+                if let Err(e) = client.reauthenticate(session).await {
+                    tracing::error!("Reauthentication failed: {}", e);
+                    return;
+                }
+
+                if let Some(mounts) = connection.mounts {
+                    for mount in mounts {
+                        if let Err(e) = crate::filesystem::mount(
+                            client.clone(),
+                            mount.host_drive.as_str(),
+                            mount.mount_point.as_str(),
+                            mount.scope,
+                        )
+                            .await
+                        {
+                            tracing::error!("Failed to mount {}: {}", mount.host_drive, e);
+                        }
+                    }
+                }
+            });
+        }
+    });
+
 
     #[cfg(unix)]
     let path_str = "/tmp/vaultDriveClient.sock";
@@ -265,6 +243,8 @@ pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
 
     let listener = ListenerOptions::new()
         .name(name)
+        .reclaim_name(true)
+        .try_overwrite(true)
         .create_tokio()?;
 
 
@@ -326,9 +306,3 @@ async fn handle_client(stream: impl AsyncReadExt + AsyncWriteExt + Unpin ){
         warn!("Failed to write response: {}", e);
     }
 }
-
-
-
-
-
-

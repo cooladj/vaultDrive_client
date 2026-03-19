@@ -3,7 +3,7 @@
 pub struct Request {
     #[prost(
         oneof = "request::RequestType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19"
     )]
     pub request_type: ::core::option::Option<request::RequestType>,
 }
@@ -33,8 +33,6 @@ pub mod request {
         ListVolumes(super::ListVolumesRequest),
         #[prost(message, tag = "11")]
         GetVolumeInfo(super::GetVolumeInfoRequest),
-        #[prost(message, tag = "12")]
-        Watch(super::Watch),
         #[prost(message, tag = "13")]
         OpenFile(super::OpenFileRequest),
         #[prost(message, tag = "14")]
@@ -45,11 +43,15 @@ pub mod request {
         CloseFile(super::CloseFileRequest),
         #[prost(message, tag = "17")]
         OverrideFile(super::OverrideFileRequest),
+        #[prost(message, tag = "18")]
+        Reauthenticate(super::ReAuthenticateRequest),
+        #[prost(message, tag = "19")]
+        Remove(super::RemoveRequest),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Response {
-    #[prost(oneof = "response::ResponseType", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(oneof = "response::ResponseType", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
     pub response_type: ::core::option::Option<response::ResponseType>,
 }
 /// Nested message and enum types in `Response`.
@@ -74,8 +76,6 @@ pub mod response {
         VolumeInfo(super::VolumeInfoResponse),
         #[prost(message, tag = "9")]
         Error(super::ErrorResponse),
-        #[prost(message, tag = "10")]
-        Watch(super::Watch),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -84,6 +84,22 @@ pub struct AuthenticateRequest {
     pub username: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub password: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub connection_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "4")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveRequest {
+    #[prost(string, tag = "1")]
+    pub connection_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReAuthenticateRequest {
+    #[prost(string, tag = "1")]
+    pub connection_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CloseFileRequest {
@@ -270,13 +286,6 @@ pub struct VolumeInfo {
     pub total_size: u64,
     #[prost(uint64, tag = "5")]
     pub available_space: u64,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Watch {
-    #[prost(string, tag = "1")]
-    pub drive: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "2")]
-    pub path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OperationSuccessResponse {

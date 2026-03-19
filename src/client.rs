@@ -3,20 +3,24 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
+use aes_gcm::{Aes256Gcm, KeyInit};
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
-use keyring::Entry;
+use ed25519_dalek::SigningKey;
 use log::info;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use rand_core::{OsRng, RngCore};
 use tokio::join;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::debug;
 use winfsp::host::FileSystemHost;
-use crate::auth::{authenticate, session};
-use crate::driveManagerUI::ConnectionType;
+use orion::aead;
+use crate::auth::{authenticate, reauthenticate, session};
+use crate::autoRun::{connection, remove_connection};
+use crate::driveManagerUI::{ConnectionType, ScopeType};
 use crate::filesystem::winfsp::{VirtualFileSystem};
 use crate::network::{QuicClient, read_message, write_message, ZERO_ADDR};
 use crate::proto::hub;
@@ -35,10 +39,10 @@ pub struct VaultDriveClient {
     pub quic: &'static QuicClient,
     pub session: Arc<RwLock<Option<session>>>,
     pub server_addr: RwLock<SocketAddr>,
-    pub mount_points: DashSet<String>,
 
-    ///local mount point , (mount thread handle, host mount point)
-    pub mounts: DashMap<String, (MOUNT_TYPES, String)>
+    ///local mount point , (mount thread handle, host mount point, Scope)
+    pub mounts: DashMap<String, (MOUNT_TYPES, String, Arc<parking_lot::RwLock<String>>)>,
+    pub scope: String,
 
 }
 
@@ -48,7 +52,7 @@ pub static VAULT_DRIVE_MAP: Lazy<DashMap<(SocketAddr, String), Arc<VaultDriveCli
 
 
 impl VaultDriveClient {
-    pub async fn new(server_addr: SocketAddr, username: String) -> Result<Arc<Self>> {
+    pub async fn new(server_addr: SocketAddr, username: String, scope: String) -> Result<Arc<Self>> {
         if let Some(existing) = VAULT_DRIVE_MAP.get(&(server_addr, username)) {
             return Ok(existing.clone());
         }
@@ -58,15 +62,19 @@ impl VaultDriveClient {
             quic,
             session: Arc::new(RwLock::new(None)),
             server_addr: RwLock::new(server_addr),
-            mount_points: DashSet::new(),
             mounts: DashMap::new(),
+            scope,
         });
 
         Ok(client)
     }
 
-    pub async fn renew_connection(self: Arc<Self>, session: session) -> Result<SocketAddr> {
+    pub async fn renew_connection(self: Arc<Self>) -> Result<SocketAddr> {
         debug!("Starting renew connection");
+        let session = self.session.read().await
+            .as_ref()
+            .expect("Session is None")
+            .clone();
 
         if let Some(hostname) = &session.hostname {
             let current_server_addr = *self.server_addr.read().await;
@@ -114,7 +122,7 @@ impl VaultDriveClient {
     }
 
 
-    pub async fn connect(self: Arc<Self>, username: &str, entry: &Entry, hostname: Option<String>) -> Result<SocketAddr> {
+    pub async fn connect(self: Arc<Self>, username: &str, password: String, hostname: Option<String>) -> Result<SocketAddr> {
         tracing::debug!("Connecting to Vault Drive for user {:?}", username);
         let server_addr = *self.server_addr.read().await;
 
@@ -122,7 +130,7 @@ impl VaultDriveClient {
             .context("Failed to connect to server")?;
 
 
-        let authenticate_request = self.authenticate_internal(username, &entry).await
+        let authenticate_request = self.authenticate_internal(username, password, &hostname).await
             .context("Authentication failed")?;
 
 
@@ -195,7 +203,7 @@ impl VaultDriveClient {
 
         Ok(response)
     }
-    async fn reauthenticate(&self, session: session) -> Result<AuthenticationSuccessResponse>{
+    pub(crate) async fn reauthenticate(&self, session: session) -> Result<AuthenticationSuccessResponse>{
         let server_addr = *self.server_addr.read().await;
 
         tracing::debug!("authenticate_internal: Opening bidirectional stream to {:?}", server_addr);
@@ -205,14 +213,11 @@ impl VaultDriveClient {
             None => { (ConnectionType::Direct,server_addr.to_string() )}
             Some(hostname) => {(ConnectionType::Hub,hostname)}
         };
-        let service = format!("vaultDrive|{}|{}",
-                              connection_type,
-                              connection_point,
-        );
-        let entry = Entry::new(&service, session.authenticate_request.user_id.as_str())?;
-        let result=authenticate(&mut send, &mut recv, session.authenticate_request.user_id.as_str(), entry.get_password()?.as_str(), server_addr ).await;
+
+
+        let result = reauthenticate(&mut send, &mut recv, session.authenticate_request.user_id.clone(), connection_type, connection_point.clone(), server_addr,self.scope.clone()).await;
         if result.is_err(){
-            entry.delete_credential();
+            remove_connection(connection_type,connection_point,session.authenticate_request.user_id);
 
         }else {
             self.quic.reAuth.notify_waiters();
@@ -221,21 +226,45 @@ impl VaultDriveClient {
 
     }
 
-    async fn authenticate_internal(&self, username: &str, entry: &Entry) -> Result<AuthenticationSuccessResponse> {
+    async fn authenticate_internal(&self, username: &str, password: String, hostname: &Option<String>) -> Result<AuthenticationSuccessResponse> {
         tracing::debug!("authenticate_internal: Getting server address");
         let server_addr = *self.server_addr.read().await;
 
+
         tracing::debug!("authenticate_internal: Opening bidirectional stream to {:?}", server_addr);
-        let (mut send, mut recv) = self.quic.open_bi(server_addr, username.to_string()).await
+        let (mut send, mut recv) = self.quic.open_bi(server_addr.clone(), username.to_string()).await
             .context("Failed to open bidirectional stream")?;
 
+        tracing::debug!("this is a new log");
+
         tracing::debug!("authenticate_internal: Stream opened successfully, calling authenticate");
+        tracing::debug!("this is a new log");
 
-        let result = authenticate(&mut send, &mut recv, username, entry.get_password()?.as_str(), server_addr).await;
+        let (connection_type, connection_point) = if let Some(hostname) = hostname {
+            tracing::debug!("authenticate_internal: using hub connection");
+            (ConnectionType::Hub, hostname.to_string())
+        } else {
+            tracing::debug!("authenticate_internal: using direct connection");
+            (ConnectionType::Direct, server_addr.to_string())
+        };
+        tracing::debug!("authenticate_internal: building connection row");
 
-        if result.is_err(){
-            entry.delete_credential()?;
-        }
+        let key = aead::SecretKey::default();
+        tracing::debug!("authenticate_internal: key generated");
+
+        let connection_row = connection{
+            connection_id: uuid::Uuid::new_v4().to_string(),
+            connection_type,
+            connection_point,
+            username: username.to_string(),
+            scope: self.scope.clone(),
+            key: key.unprotected_as_bytes().to_vec(),
+            mounts: None,
+        };
+
+        let result = authenticate(&mut send, &mut recv, username, password, server_addr, connection_row).await;
+
+
         result
     }
 
@@ -516,30 +545,38 @@ impl VaultDriveClient {
             None => (ConnectionType::Direct, server_addr.to_string()),
             Some(hostname) => (ConnectionType::Hub, hostname.clone()),
         };
-        let username = session.authenticate_request.user_id.to_string();
+        let username = session.authenticate_request.user_id.clone();
 
-       VAULT_DRIVE_MAP.remove(&(server_addr.clone(), username));
+       VAULT_DRIVE_MAP.remove(&(server_addr.clone(), username.clone()));
 
         self.mounts.clear();
 
-        let service = format!("vaultDrive|{}|{}", connection_type, connection_point);
+        remove_connection(connection_type, connection_point, username);
 
-        if let Ok(entry) = Entry::new(&service, &session.authenticate_request.user_id) {
-            let _ = entry.delete_credential();
-        }
     }
     
-    pub async fn disconnect(&self) {
+    pub async fn disconnect(&self, connection_id : String) -> Result<()> {
         let (server_addr_guard, session_guard) = join!(
     self.server_addr.read(),
     self.session.read()
 );
+        let request = Request {
+            request_type: Some(request::RequestType::Remove(RemoveRequest {
+                 connection_id,
+            })),
+        };
+
+        self.mounts.clear();
+
+
+        self.execute_request(request).await?;
 
         let server_addr = *server_addr_guard;
         let username = session_guard.as_ref().unwrap().authenticate_request.user_id.clone();
 
         self.quic.close(server_addr, username);
         *self.session.write().await= None;
+        Ok(())
     }
 }
 

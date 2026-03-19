@@ -15,12 +15,11 @@ use tokio::join;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use keyring::Entry;
-use rusqlite::fallible_iterator::FallibleIterator;
 use serde::{Deserialize, Serialize};
-use crate::autoRun::{auto_run, exists, insert, remove};
+use winreg::types::ToRegValue;
+use crate::autoRun::{connection, get_scope, insert_mount, mounts, remove_connection, remove_mount, update_scope};
 use crate::client::{VAULT_DRIVE_MAP, VaultDriveClient};
-use crate::driveManagerUI::{Connection, ConnectionType, Drive};
+use crate::driveManagerUI::{Connection, ConnectionType, Drive, ScopeType};
 use crate::filesystem::{mount_to_UI_tuple};
 use crate::network::ZERO_ADDR;
 
@@ -30,7 +29,9 @@ pub enum SocketCommand {
     Connect{
         connection_type: ConnectionType,
         connection_point:String,
-        username: String
+        username: String,
+        password: String,
+        scope_type: ScopeType
     },
     UnMount {
         mount_point: String,
@@ -43,10 +44,21 @@ pub enum SocketCommand {
         drive: String,
         socketaddr: SocketAddr,
         username: String,
+        scope: String,
 
     },
     Volumes {
-        connection: Option<Connection>
+        user_id: String,
+        connection: Option<Connection>,
+        elevated : bool,
+    },
+    Scope{
+        scope: String,
+        username:String,
+        socketaddr: SocketAddr,
+        mount_point: String,
+        
+        
     },
     Health,
 
@@ -54,17 +66,6 @@ pub enum SocketCommand {
         username:String,
         socketaddr: SocketAddr,
     },
-    AutoMount{
-        mount_point: String,
-        drive: String,
-        socketaddr: SocketAddr,
-        username: String,
-    },
-    UnAutoMount{
-        drive: String,
-        socketaddr: SocketAddr,
-        username: String,
-}
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ResponseData {
@@ -81,24 +82,18 @@ pub enum CommandResponse {
 
 pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
     match command {
-        SocketCommand::Connect { connection_type: connection_method, connection_point,username} => {
-            let service = format!("vaultDrive|{}|{}",
-                                  connection_method,
-                                    connection_point
-            );
-            let entry = match Entry::new(&service, username.as_str()) {
-                Ok(entry) => entry,
-                Err(e) => return CommandResponse::Error(e.to_string())
-            };
+        SocketCommand::Connect { connection_type: connection_method, connection_point,username, password, scope_type} => {
+
+
           let operation =  if connection_method == ConnectionType::Direct{
               let sockerAdder:SocketAddr = match   connection_point.parse(){
                   Ok(socket) => socket,
                   Err(e) => return CommandResponse::Error(e.to_string()),
               };
 
-                  connectionDirect(sockerAdder, username.as_str(),&entry).await
+                  connectionDirect(sockerAdder, username.as_str(),password, scope_type).await
             }else {
-              connectionHub( &*connection_point, username.as_str(),&entry).await
+              connectionHub( &*connection_point, username.as_str(),password, scope_type).await
           };
           match operation {
               Ok(socket_addr) => CommandResponse::Success(ResponseData::Text(socket_addr.to_string())),
@@ -106,8 +101,8 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
           }
         }
 
-        SocketCommand::Mount {mount_point, socketaddr, username, drive} => {
-            match execute_mount(&mount_point, socketaddr,  &username,  &drive).await {
+        SocketCommand::Mount {mount_point, socketaddr, username, drive,  scope} => {
+            match execute_mount(&mount_point, socketaddr,  &username,  &drive, scope).await {
                 Ok(_) => CommandResponse::Success(ResponseData::Empty),
                 Err(e) => CommandResponse::Error(e.to_string()),
             }
@@ -118,30 +113,24 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
                 Err(e) => CommandResponse::Error(e.to_string()),
             }
         }
-        SocketCommand::Volumes { connection }  => {
+        SocketCommand::Volumes { connection, user_id,elevated }  => {
             match connection {
                 None => {
-                    match execute_get_ui_connections().await {
+                    match execute_get_ui_connections(user_id, elevated).await {
                     Ok(volumes) => CommandResponse::Success(ResponseData::VolumesInfoData(volumes)),
                     Err(e) => CommandResponse::Error(e.to_string()),
                 }}
                 Some(connection) => {
                     // todo instead of refreshing all connection refresh one
-                    match execute_get_ui_connections().await {
+                    match execute_get_ui_connections(user_id, elevated).await {
                         Ok(volumes) => CommandResponse::Success(ResponseData::VolumesInfoData(volumes)),
                         Err(e) => CommandResponse::Error(e.to_string()),
                     }}
             }
 
         }
-        SocketCommand::AutoMount {mount_point, drive,  username, socketaddr } => {
-            match execute_set_auto_mount(mount_point, socketaddr, username, drive).await {
-                Ok(_) => CommandResponse::Success(ResponseData::Empty),
-                Err(e) => CommandResponse::Error(e.to_string()),
-            }
-        },
-        SocketCommand::UnAutoMount {  drive,  username, socketaddr} => {
-            match execute_un_auto_mount(drive, socketaddr, username).await {
+        SocketCommand::Scope {scope, username, mount_point, socketaddr} => {
+            match execute_scope_change(mount_point, socketaddr, username, scope).await {
                 Ok(_) => CommandResponse::Success(ResponseData::Empty),
                 Err(e) => CommandResponse::Error(e.to_string()),
             }
@@ -216,25 +205,16 @@ pub async fn execute_unmount(mount_point: String, server: SocketAddr, username:S
     let host = client.mounts
         .remove(&mount_point);
 
-    if let Some((_, (_, host_drive))) = host {
+    if let Some((_, (_, host_drive, _))) = host {
         let (connection_type, connection_point) = client.session.read().await
             .as_ref()
             .and_then(|session| session.hostname.as_ref())
             .map(|hostname| (ConnectionType::Hub, hostname.clone()))
             .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
 
-        let auto_run = auto_run::new(
-            connection_type,
-            connection_point,
-            username,
-            host_drive,
-            "".to_string()
-        );
 
-        tokio::task::spawn_blocking(move || {
-            remove(auto_run).context(format!("Failed to remove auto-mount {:?}", mount_point));
 
-        }).await?;
+            remove_mount(connection_type, &connection_point, &username, &mount_point).await?;
     }
 
     Ok(())
@@ -245,20 +225,41 @@ pub async fn execute_set_auto_mount(mount_point: String, server: SocketAddr, use
         .map(|entry| entry.clone())
         .ok_or_else(|| anyhow!("Client not found"))?;
 
+
     let (connection_type, connection_point) = client.session.read().await
         .as_ref()
         .and_then(|session| session.hostname.as_ref())
         .map(|hostname| (ConnectionType::Hub, hostname.clone()))
         .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
-    
-    let auto_run = auto_run::new(connection_type, connection_point, username, drive, mount_point);
-    tokio::task::spawn_blocking(move || {
-        insert(auto_run).context(format!("Failed to remove auto-mount {:?}", connection_type));
-    }).await?;
+
+        insert_mount(connection_type,&connection_point,&username,&mount_point,&drive).await?;
+
     Ok(())
 }
 
 pub async fn execute_un_auto_mount(drive:  String, server: SocketAddr, username:String) -> Result<()>{
+    let client = VAULT_DRIVE_MAP
+        .get(&(server, username.to_string()))
+        .map(|entry| entry.clone())
+        .ok_or_else(|| anyhow!("Client not found"))?;
+
+
+
+    let (connection_type, connection_point) = client.session.read().await
+        .as_ref()
+        .and_then(|session| session.hostname.as_ref())
+        .map(|hostname| (ConnectionType::Hub, hostname.clone()))
+        .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
+        remove_mount(connection_type, &connection_point, &username, &drive).await?;
+    Ok(())
+}
+
+pub async fn execute_scope_change(
+    mount_point: String,
+    server: SocketAddr,
+    username: String,
+    scope_type: String,
+) -> Result<()> {
     let client = VAULT_DRIVE_MAP
         .get(&(server, username.to_string()))
         .map(|entry| entry.clone())
@@ -269,10 +270,23 @@ pub async fn execute_un_auto_mount(drive:  String, server: SocketAddr, username:
         .and_then(|session| session.hostname.as_ref())
         .map(|hostname| (ConnectionType::Hub, hostname.clone()))
         .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
-    let auto_run = auto_run::new(connection_type, connection_point, username, drive, "".to_string());
-    tokio::task::spawn_blocking(move || {
-        remove(auto_run).context(format!("Failed to remove auto-mount {:?}", connection_type));
-    }).await?;
+
+    if let Some(mount) = client.mounts.get(&mount_point) {
+        *mount.value().2.write() = scope_type.clone();
+        let drive = mount.value().1.clone();
+        
+        drop(mount);
+        update_scope(
+            connection_type,
+            connection_point,
+            username,
+            mount_point,
+            drive,
+            scope_type,
+        )
+            .await?;
+    }
+
     Ok(())
 }
 
@@ -285,7 +299,16 @@ pub async fn execute_disconnect(username: String, server: SocketAddr) -> Result<
 
     // Have to call clear first because the the virtual file system own the ARC
     // if you dont clear before calling drop you will just decrement the arc and not drop the vale
-    client.1.mounts.clear();
+    let (connection_type,connection_point )=client.1.session.read().await
+        .as_ref()
+        .and_then(|session| session.hostname.as_ref())
+        .map(|hostname| (ConnectionType::Hub, hostname.clone()))
+        .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
+
+   if let Some(connection_id) = remove_connection(connection_type, connection_point, username).await?{
+        client.1.disconnect(connection_id).await?;
+
+    };
 
     drop(client);
     Ok(())
@@ -296,12 +319,15 @@ pub async fn execute_disconnect(username: String, server: SocketAddr) -> Result<
 
 
 
-pub async fn execute_get_ui_connections() -> Result<Vec<Connection>> {
-    let clients: Vec<Arc<VaultDriveClient>> =
-        VAULT_DRIVE_MAP
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect();
+pub async fn execute_get_ui_connections(user_id: String, elevated: bool) -> Result<Vec<Connection>> {
+
+    let clients: Vec<Arc<VaultDriveClient>> = VAULT_DRIVE_MAP
+        .iter()
+        .filter(|entry| {
+            entry.value().scope == user_id || (elevated && entry.value().scope == "")
+        })
+        .map(|entry| entry.value().clone())
+        .collect();
 
     debug!("{:?} this is the client length", clients.len());
 
@@ -351,17 +377,10 @@ pub async fn execute_get_ui_connections() -> Result<Vec<Connection>> {
                     (ConnectionType::Direct, server_addr.to_string())
                 };
 
-                let auto_run = auto_run::new(
-                    connection_type,
-                    connection_point,
-                    username.clone(),
-                    volume.root_path.clone(),
-                    "".to_string(),
-                );
+                let username_clone = username.clone();
+                let host_drive = volume.root_path.clone();
 
-                // Spawn the blocking task
-                exists_futures.push(tokio::task::spawn_blocking(move || exists(auto_run)));
-
+                exists_futures.push(get_scope(connection_type, connection_point, username_clone.clone(), host_drive));
                 // Store the volume data
                 volume_data.push((volume, path, label));
             }
@@ -373,17 +392,7 @@ pub async fn execute_get_ui_connections() -> Result<Vec<Connection>> {
             let drives: Vec<Drive> = volume_data.into_iter()
                 .zip(exists_results.into_iter())
                 .map(|((volume, path, label), exists_result)| {
-                    let exist = match exists_result {
-                        Ok(Ok(result)) => result,
-                        Ok(Err(e)) => {
-                            tracing::error!("exists check failed for {}: {:?}", volume.name, e);
-                            false
-                        }
-                        Err(e) => {
-                            tracing::error!("spawn_blocking failed for {}: {:?}", volume.name, e);
-                            false
-                        }
-                    };
+                    let exist = exists_result.unwrap_or_default();
 
                     Drive::new(
                         &volume.name,
@@ -425,24 +434,24 @@ pub async fn execute_get_ui_connections() -> Result<Vec<Connection>> {
 }
 
 
-pub async fn connectionDirect( server: SocketAddr, username: &str, entry: &Entry) -> Result<SocketAddr> {
+pub async fn connectionDirect( server: SocketAddr, username: &str, password: String, scope_type: ScopeType) -> Result<SocketAddr> {
     tracing::debug!("Connecting to Direct Vault Drive for user {:?} socketaddr {:?}", username, server);
-    let client = VaultDriveClient::new(server, username.parse()?).await?;
+    let client = VaultDriveClient::new(server, username.parse()?, scope_type.to_string()).await?;
 
-    let server_addr = client.connect(&username, entry, None).await?;
+    let server_addr = client.connect(&username, password, None).await?;
     
     
     Ok(server_addr)
 }
-pub async fn connectionHub( hostname: &str, username: &str,  entry: &Entry) -> Result<SocketAddr> {
+pub async fn connectionHub( hostname: &str, username: &str,  password: String, scope_type: ScopeType) -> Result<SocketAddr> {
     tracing::debug!("Connecting to hub Vault Drive for user {:?} ", username );
 
     //this is just used to make it default could make it an optional
     //but this should be the only time it is it really need an empty
     let defaultSockerAddr: SocketAddr = ZERO_ADDR;
-    let client = VaultDriveClient::new(defaultSockerAddr, username.parse()?).await?;
+    let client = VaultDriveClient::new(defaultSockerAddr, username.parse()?, scope_type.to_string()).await?;
     client.connect_to_hub( hostname).await?;
-    let server_addr = client.connect(username, entry, Some(hostname.to_string())).await?;
+    let server_addr = client.connect(username, password, Some(hostname.to_string())).await?;
 
     
 
@@ -454,16 +463,25 @@ pub async fn execute_mount(
     mount_point: &str,
     server: SocketAddr,
     username: &str,
-    drive: &str
+    drive: &str,
+    scope: String,
 ) -> Result<()> {
     let client = VAULT_DRIVE_MAP
         .get(&(server, username.to_string()))
         .map(|entry| entry.clone())
         .ok_or_else(|| anyhow!("Client not found"))?;
 
+    let (connection_type, connection_point) = client.session.read().await
+        .as_ref()
+        .and_then(|session| session.hostname.as_ref())
+        .map(|hostname| (ConnectionType::Hub, hostname.clone()))
+        .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
+
     debug!("Executing mount {:?}", mount_point);
 
-    let _mount = crate::filesystem::mount(client, mount_point, drive).await?;
+    let _mount = crate::filesystem::mount(client, mount_point, drive, scope).await?;
+    insert_mount(connection_type,&connection_point,&username,&mount_point,&drive).await?;
+
     Ok(())
 }
 
