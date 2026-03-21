@@ -114,6 +114,8 @@ pub struct AuthenticationSuccessResponse {
     pub user_id: ::prost::alloc::string::String,
     #[prost(uint32, optional, tag = "3")]
     pub port: ::core::option::Option<u32>,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    pub cert: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OverrideFileRequest {

@@ -7,7 +7,6 @@ message HubRequest {
   oneof request_type {
     ServerHelloRequest server_hello_req = 1;
     ServerHelloResponse server_hello_res = 2;
-    AdmitResponse admit_res = 5;
     KeepAliveRequest keep_alive_req = 6;
     KeepAliveResponse keep_alive_res = 7;
     NatPokeRequest nat_poke_req = 8;
@@ -18,8 +17,13 @@ message HubRequest {
     CreateCheckoutSessionResponse checkout_res = 13;
     ClientHelloRequest client_hello_req = 14;
     ClientHelloResponse client_hello_res = 15;
-    HostNameRequest hostname_req= 16;
-    HostNameResponse hostname_res=17;
+    SetHostNameRequest set_hostname_req= 16;
+    SetHostNameResponse set_hostname_res=17;
+    NotifyRequest notify_req=18;
+    DisconnectRequest disconnect_req=19;
+    GetHostNameRequest get_hostname_req =20;
+    GetHostNameResponse get_hostname_res =21;
+
   }
 }
 
@@ -31,37 +35,43 @@ message ServerHelloRequest {
 message ServerHelloResponse {
   bool accepted = 1;
   optional string reason = 2;
-}
-
-message HostNameRequest{
-}
-message HostNameResponse{
-  string hostname = 1;
-}
-
-message AdmitResponse {
-  bool ok = 1;
-  optional string reason = 2;
   optional string hostname =3;
+}
+
+message SetHostNameRequest{
+  string hostname = 1;
+  string device_id = 2;
+
+
+}
+message SetHostNameResponse{
+  bool success = 1;
+  optional string error = 2;
+}
+
+message GetHostNameRequest{
+  string device_id =1;
+}
+message GetHostNameResponse{
+  optional string hostname = 1;
 }
 
 // Hub-initiated keep-alive (server only responds)
 message KeepAliveRequest {
-  string unique_id = 1;
 }
 
 message KeepAliveResponse {
-  bool alive = 1;
 }
 
 // Hub-initiated NAT traversal
 message NatPokeRequest {
-  string client_ip = 1;
-  uint32 client_port = 2;
+  string client_socket_addr=1;
+
 }
 
 message NatPokeResponse {
   bool reached = 1;
+  optional string private_socket_addr=2;
 }
 
 message HealthCheckRequest {}
@@ -83,12 +93,22 @@ message CreateCheckoutSessionResponse {
   bool new = 3;
 }
 
-// Client server discovery
 message ClientHelloRequest {
   string unique_id = 1;
+  optional string private_socket_addr=2;
 }
 
 message ClientHelloResponse {
   bool found = 1;
   optional string socket_addr = 2;
+  optional string secondary_socket_addr = 3;
+}
+
+message NotifyRequest {
+  string id = 1;
+  string event = 2;
+}
+
+message DisconnectRequest{
+  uint64 time=1;
 }

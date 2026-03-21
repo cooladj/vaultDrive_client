@@ -3,7 +3,7 @@
 pub struct HubRequest {
     #[prost(
         oneof = "hub_request::RequestType",
-        tags = "1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
+        tags = "1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
     )]
     pub request_type: ::core::option::Option<hub_request::RequestType>,
 }
@@ -15,8 +15,6 @@ pub mod hub_request {
         ServerHelloReq(super::ServerHelloRequest),
         #[prost(message, tag = "2")]
         ServerHelloRes(super::ServerHelloResponse),
-        #[prost(message, tag = "5")]
-        AdmitRes(super::AdmitResponse),
         #[prost(message, tag = "6")]
         KeepAliveReq(super::KeepAliveRequest),
         #[prost(message, tag = "7")]
@@ -38,9 +36,17 @@ pub mod hub_request {
         #[prost(message, tag = "15")]
         ClientHelloRes(super::ClientHelloResponse),
         #[prost(message, tag = "16")]
-        HostnameReq(super::HostNameRequest),
+        SetHostnameReq(super::SetHostNameRequest),
         #[prost(message, tag = "17")]
-        HostnameRes(super::HostNameResponse),
+        SetHostnameRes(super::SetHostNameResponse),
+        #[prost(message, tag = "18")]
+        NotifyReq(super::NotifyRequest),
+        #[prost(message, tag = "19")]
+        DisconnectReq(super::DisconnectRequest),
+        #[prost(message, tag = "20")]
+        GetHostnameReq(super::GetHostNameRequest),
+        #[prost(message, tag = "21")]
+        GetHostnameRes(super::GetHostNameResponse),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -54,46 +60,50 @@ pub struct ServerHelloResponse {
     pub accepted: bool,
     #[prost(string, optional, tag = "2")]
     pub reason: ::core::option::Option<::prost::alloc::string::String>,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct HostNameRequest {}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct HostNameResponse {
-    #[prost(string, tag = "1")]
-    pub hostname: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct AdmitResponse {
-    #[prost(bool, tag = "1")]
-    pub ok: bool,
-    #[prost(string, optional, tag = "2")]
-    pub reason: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "3")]
     pub hostname: ::core::option::Option<::prost::alloc::string::String>,
 }
-/// Hub-initiated keep-alive (server only responds)
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct KeepAliveRequest {
+pub struct SetHostNameRequest {
     #[prost(string, tag = "1")]
-    pub unique_id: ::prost::alloc::string::String,
+    pub hostname: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub device_id: ::prost::alloc::string::String,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct KeepAliveResponse {
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetHostNameResponse {
     #[prost(bool, tag = "1")]
-    pub alive: bool,
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error: ::core::option::Option<::prost::alloc::string::String>,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetHostNameRequest {
+    #[prost(string, tag = "1")]
+    pub device_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetHostNameResponse {
+    #[prost(string, optional, tag = "1")]
+    pub hostname: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Hub-initiated keep-alive (server only responds)
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct KeepAliveRequest {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct KeepAliveResponse {}
 /// Hub-initiated NAT traversal
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NatPokeRequest {
     #[prost(string, tag = "1")]
-    pub client_ip: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "2")]
-    pub client_port: u32,
+    pub client_socket_addr: ::prost::alloc::string::String,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NatPokeResponse {
     #[prost(bool, tag = "1")]
     pub reached: bool,
+    #[prost(string, optional, tag = "2")]
+    pub private_socket_addr: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthCheckRequest {}
@@ -120,11 +130,12 @@ pub struct CreateCheckoutSessionResponse {
     #[prost(bool, tag = "3")]
     pub new: bool,
 }
-/// Client server discovery
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClientHelloRequest {
     #[prost(string, tag = "1")]
     pub unique_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub private_socket_addr: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClientHelloResponse {
@@ -132,4 +143,18 @@ pub struct ClientHelloResponse {
     pub found: bool,
     #[prost(string, optional, tag = "2")]
     pub socket_addr: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub secondary_socket_addr: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NotifyRequest {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub event: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DisconnectRequest {
+    #[prost(uint64, tag = "1")]
+    pub time: u64,
 }

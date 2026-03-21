@@ -18,6 +18,7 @@ use tokio::time::timeout;
 use tracing::debug;
 use winfsp::host::FileSystemHost;
 use orion::aead;
+use quinn::Connection;
 use crate::auth::{authenticate, reauthenticate, session};
 use crate::autoRun::{connection, remove_connection};
 use crate::driveManagerUI::{ConnectionType, ScopeType};
@@ -39,6 +40,7 @@ pub struct VaultDriveClient {
     pub quic: &'static QuicClient,
     pub session: Arc<RwLock<Option<session>>>,
     pub server_addr: RwLock<SocketAddr>,
+    pub secondary_server_addr: RwLock<Option<SocketAddr>>,
 
     ///local mount point , (mount thread handle, host mount point, Scope)
     pub mounts: DashMap<String, (MOUNT_TYPES, String, Arc<parking_lot::RwLock<String>>)>,
@@ -62,6 +64,7 @@ impl VaultDriveClient {
             quic,
             session: Arc::new(RwLock::new(None)),
             server_addr: RwLock::new(server_addr),
+            secondary_server_addr: RwLock::new(None),
             mounts: DashMap::new(),
             scope,
         });
@@ -71,63 +74,98 @@ impl VaultDriveClient {
 
     pub async fn renew_connection(self: Arc<Self>) -> Result<SocketAddr> {
         debug!("Starting renew connection");
+
         let session = self.session.read().await
             .as_ref()
             .expect("Session is None")
             .clone();
 
-        if let Some(hostname) = &session.hostname {
-            let current_server_addr = *self.server_addr.read().await;
+        let user_id = session.authenticate_request.user_id.clone();
 
+        // If we have a hostname, resolve new server addr from hub
+        if let Some(hostname) = &session.hostname {
+            let old_addr = *self.server_addr.read().await;
             self.connect_to_hub(hostname.as_str()).await?;
             debug!("Got server addr from hub");
 
-            let new_server_addr = *self.server_addr.read().await;
-
-            if current_server_addr != new_server_addr {
-                let sessionClone = session.clone();
-                VAULT_DRIVE_MAP.insert((new_server_addr, sessionClone.authenticate_request.user_id.clone()), self.clone());
-                VAULT_DRIVE_MAP.remove(&(current_server_addr, sessionClone.authenticate_request.user_id));
-                self.quic.connection.remove(&current_server_addr);
-                debug!("Performing renew connection clean up")
+            let new_addr = *self.server_addr.read().await;
+            if old_addr != new_addr {
+                VAULT_DRIVE_MAP.insert((new_addr, user_id.clone()), self.clone());
+                VAULT_DRIVE_MAP.remove(&(old_addr, user_id.clone()));
+                self.quic.connection.remove(&old_addr);
+                debug!("Performing renew connection clean up");
             }
         }
 
-        let server_addr = *self.server_addr.read().await;
+        let mut server_addr = *self.server_addr.read().await;
         debug!("Removing old connection");
         let old_connection = self.quic.connection.remove(&server_addr);
+
         debug!("About to call connect for {}", server_addr);
 
-        match self.quic.connect(&server_addr).await{
-            Ok(_) => {}
-            Err(_) => {
-                // this is here because if connection fails because no internet,
-                // instead of removing the connection and unmounting, keep the dead connection
-                // and mount which allow for auto reauth later 
-                if let Some(old_conn) = old_connection {
-                    self.quic.connection.insert(server_addr, old_conn.1);
+        if self.quic.connect(&server_addr, Some(true)).await.is_err() {
+            // Primary failed — try secondary
+            let sec_addr = match *self.secondary_server_addr.read().await {
+                Some(addr) => addr,
+                None => {
+                    Self::restore_old_conn(&self.quic, server_addr, old_connection);
+                    bail!("Primary connection failed and no secondary address available");
                 }
-                return Err(anyhow!("Failed to connect to {}", server_addr));
+            };
+
+            match self.quic.connect(&sec_addr, Some(true)).await {
+                Ok(_) => {
+                    *self.server_addr.write().await = sec_addr;
+                    VAULT_DRIVE_MAP.insert((sec_addr, user_id.clone()), self.clone());
+                    VAULT_DRIVE_MAP.remove(&(server_addr, user_id.clone()));
+                    server_addr = sec_addr;
+                }
+                Err(_) => {
+                    Self::restore_old_conn(&self.quic, server_addr, old_connection);
+                    bail!("Primary connection failed and no secondary address available");
+                }
             }
         }
-        drop(old_connection);
-        debug!("Connecting to {}", server_addr);
 
-        let _reauthenticate_request = self.reauthenticate(session).await
+        debug!("Connected to {}", server_addr);
+
+        let reauth = self.reauthenticate(session).await
             .context("Authentication failed")?;
 
-        debug!("Authentication succeeded for {}", _reauthenticate_request.host_name);
+        debug!("Authentication succeeded for {}", reauth.host_name);
 
         Ok(server_addr)
     }
 
+    /// Restore the old connection if reconnection fails (keeps mount alive for auto-reauth)
+    fn restore_old_conn(
+        quic: &QuicClient,
+        addr: SocketAddr,
+        old_connection: Option<(SocketAddr, Connection)>,
+    ) {
+        if let Some(old_conn) = old_connection {
+            quic.connection.insert(addr, old_conn.1);
+        }
+    }
 
-    pub async fn connect(self: Arc<Self>, username: &str, password: String, hostname: Option<String>) -> Result<SocketAddr> {
+
+    pub async fn connect(self: Arc<Self>, username: &str, password: String, hostname: Option<String>, tofu_enable:  bool) -> Result<SocketAddr> {
         tracing::debug!("Connecting to Vault Drive for user {:?}", username);
-        let server_addr = *self.server_addr.read().await;
+        let mut server_addr = *self.server_addr.read().await;
 
-        self.quic.connect(&server_addr).await
-            .context("Failed to connect to server")?;
+        match self.quic.connect(&server_addr, Some(tofu_enable)).await {
+            Ok(_) => {}
+            Err(_) => {
+                let secondary = *self.secondary_server_addr.read().await;
+                if let Some(sec_addr) = secondary {
+                    self.quic.connect(&sec_addr, Some(tofu_enable)).await?;
+                    *self.server_addr.write().await = sec_addr;
+                    server_addr = sec_addr
+                } else {
+                    bail!("Primary connection failed and no secondary address available");
+                }
+            }
+        }
 
 
         let authenticate_request = self.authenticate_internal(username, password, &hostname).await
@@ -151,9 +189,8 @@ impl VaultDriveClient {
     pub async fn connect_to_hub(&self, hostname: &str) -> Result<()> {
         let socket_addr: SocketAddr = ZERO_ADDR;
 
-
-        let (addr, conn) = self.quic.connect(&socket_addr).await
-            .context("Failed to connect to server")?;
+        let (addr, conn) = self.quic.connect(&socket_addr, None).await
+            .context("Failed to connect to hub")?;
 
         let connection_map = self.quic.connection.clone();
         tokio::spawn(async move {
@@ -161,29 +198,57 @@ impl VaultDriveClient {
             connection_map.remove(&socket_addr);
         });
 
+        let res = self.get_server_from_hub(hostname, addr).await?;
 
-        let clientHelloRes = self.get_server_from_hub(hostname, addr).await?;
-        if !clientHelloRes.found {
-            bail!(format!("Failed to connect to server: {}", hostname));
+        if !res.found {
+            bail!("Failed to connect to server: {}", hostname);
         }
-        if let Some(addr) = clientHelloRes.socket_addr {
-            *self.server_addr.write().await = addr.parse()?;
-        } else {
-            bail!("Failed to be server_addr");
+
+        let primary = res.socket_addr
+            .ok_or_else(|| anyhow!("Server found but no address provided"))?;
+
+        let server_addr: SocketAddr = match primary.parse() {
+            Ok(addr) => {
+                // Primary worked — store secondary if available
+                if let Some(ref sec) = res.secondary_socket_addr {
+                    if let Ok(sec_addr) = sec.parse::<SocketAddr>() {
+                        *self.secondary_server_addr.write().await = Some(sec_addr);
+                    }
+                }
+                addr
+            }
+            Err(_) => {
+                // Primary failed to parse — try secondary
+                let sec = res.secondary_socket_addr
+                    .ok_or_else(|| anyhow!("Primary address invalid and no secondary available"))?;
+                sec.parse().context("Both primary and secondary addresses failed to parse")?
+            }
         };
 
-    Ok(())
+        *self.server_addr.write().await = server_addr;
+
+        Ok(())
     }
     
    pub async fn get_server_from_hub(&self, hostname: &str, addr: SocketAddr) -> Result<ClientHelloResponse> {
 
         let (mut send, mut recv) = self.quic.open_bi_safe(addr).await?;
+       let port = match self.quic.endpoint.local_addr().ok() {
+           None => { None }
+           Some(sock) => { Some(sock.port()) }
+       };
+
+
+       let private_socket_addr = port
+           .and_then(|p| local_ip_address::local_ip().ok().map(|ip| format!("{}:{}", ip, p)));
+
 
         let init_req = hub::HubRequest {
             request_type: Some(RequestType::ClientHelloReq(
                 ClientHelloRequest {
                     unique_id: hostname.parse()
                         .context("Failed to parse hostname")?,
+                    private_socket_addr
                 }
             ))
         };

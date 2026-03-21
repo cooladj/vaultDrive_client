@@ -3,14 +3,20 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::thread::scope;
+use anyhow::Context;
 use futures::{SinkExt, StreamExt, TryFutureExt};
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName, };
 use interprocess::local_socket::traits::tokio::{Listener, };
 use log::{debug, info, warn};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::ServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use service_manager::*;
+use tokio_rustls::TlsAcceptor;
 use crate::autoRun::{init_db, get_connections_with_mounts};
 use crate::client::VaultDriveClient;
 use crate::commands::{connectionDirect, connectionHub, execute_socket_command, CommandResponse, ResponseData, SocketCommand};
@@ -230,6 +236,17 @@ pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
         }
     });
 
+    let (cert_der, key_der) = generate_server_cert()?;
+
+    let cert = CertificateDer::from(cert_der);
+    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key_der));
+
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)?;
+
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
 
     #[cfg(unix)]
     let path_str = "/tmp/vaultDriveClient.sock";
@@ -252,7 +269,8 @@ pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
 
     loop {
         let stream = match listener.accept().await {
-            Ok(s) => s,
+            Ok(s) =>     acceptor.accept(s).await?
+            ,
             Err(e) => {
                 warn!("Failed to accept connection: {}", e);
                 continue;
@@ -263,6 +281,29 @@ pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
             handle_client(stream).await;
         });
     }
+}
+pub fn generate_server_cert() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let cn = format!("vaultdrive-{}", uuid::Uuid::new_v4());
+
+    let mut params = CertificateParams::new(vec![cn.clone()])
+        .context("Failed to create certificate params")?;
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, &cn);
+    params.distinguished_name = dn;
+
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .context("Failed to generate key pair")?;
+
+    let cert = params.self_signed(&key_pair)
+        .context("Failed to generate server certificate")?;
+
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialize_der();
+
+    info!("Generated server certificate with CN={}", cn);
+
+    Ok((cert_der, key_der))
 }
 
 async fn handle_client(stream: impl AsyncReadExt + AsyncWriteExt + Unpin ){

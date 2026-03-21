@@ -1,5 +1,8 @@
 ﻿use sqlx::SqliteConnection;
 use sqlx::Connection;
+use rusqlite;
+
+use x509_parser::nom::complete::bool;
 use crate::driveManagerUI::ConnectionType;
 
 pub struct connection {
@@ -21,6 +24,9 @@ pub struct mounts {
 
 async fn get_connection() -> anyhow::Result<SqliteConnection> {
     Ok(SqliteConnection::connect("sqlite:database.db?mode=rwc").await?)
+}
+fn get_connection_sync() -> anyhow::Result<rusqlite::Connection> {
+    Ok(rusqlite::Connection::open("sqlite:database.db?mode=rwc")?)
 }
 
 pub async fn insert_connection(connection: connection) -> anyhow::Result<()> {
@@ -267,6 +273,27 @@ pub async fn get_scope(
     Ok(row.get("scope"))
 }
 
+
+pub fn contain_cert(cert_bytes: &[u8]) -> anyhow::Result<bool> {
+    let conn = get_connection_sync()?;
+    let rows_updated = conn.execute(
+        "UPDATE key_store SET last_seen = CURRENT_TIMESTAMP WHERE server_cert = ?",
+        [cert_bytes],
+    )?;
+    Ok(rows_updated >= 1)
+}
+
+pub fn insert_cert(cert_bytes: &[u8]) -> anyhow::Result<()> {
+    let conn = get_connection_sync()?;
+    conn.execute(
+        "INSERT INTO key_store (server_cert) VALUES (?)
+         ON CONFLICT(server_cert) DO UPDATE SET last_seen = CURRENT_TIMESTAMP",
+        [cert_bytes],
+    )?;
+    Ok(())
+}
+
+
 pub async fn init_db() -> anyhow::Result<()> {
     let mut conn = get_connection().await?;
 
@@ -293,6 +320,15 @@ pub async fn init_db() -> anyhow::Result<()> {
             FOREIGN KEY (connection_id) REFERENCES connection(id)
         )",
     )
+        .execute(&mut conn)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS key_store (
+    server_cert BLOB NOT NULL UNIQUE,
+    first_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+)",)
         .execute(&mut conn)
         .await?;
 

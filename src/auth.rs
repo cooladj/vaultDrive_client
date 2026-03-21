@@ -1,13 +1,16 @@
 use std::net::SocketAddr;
+use std::pin::Pin;
 use anyhow::{Context, Result, bail};
-use crate::network::{read_message, write_message, QuicClient};
+use crate::network::{pin_cert_client_config, read_message, write_message, QuicClient};
 use crate::proto::vaultdrive::*;
 use quinn::{ RecvStream, SendStream};
-use rustls::pki_types::ServerName;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use crate::commands::connectionDirect;
 use crate::proto::vaultdrive::response::ResponseType;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 use x509_parser::nom::AsBytes;
 use crate::autoRun::{connection, get_connection_from_db, insert_connection};
 use crate::driveManagerUI::ConnectionType;
@@ -105,6 +108,7 @@ pub async fn reauthenticate(
         )),
     };
 
+
     let auth_response: Response = read_message(recv).await
         .context("Failed to read authentication response")?;
 
@@ -112,26 +116,22 @@ pub async fn reauthenticate(
 
         Some(response::ResponseType::AuthenticationSuccess(success)) => {
             tracing::info!("Authentication successful for user: {}", username);
-            tokio::task::spawn_blocking(||{
-                insert_connection(connection);
-            }).await;
 
-            match success.port {
-                None => {}
-                Some(port) => {
-                    let child_connect = SocketAddr::new(socket_addr.ip(), port as u16);
-                    let quic = QuicClient::new().await?;
-                    let server_name= ServerName::try_from("vaultDriveServer")
-                        .context("Invalid server name")?;
+            if let (Some(port), Some(cert)) = (success.port.clone(), success.cert.clone()) {
 
-                    let conn = quic.endpoint
-                        .connect(child_connect, &server_name.to_str())?
-                        .await
-                        .context("Failed to establish QUIC connection")?;
+                let child_connect = SocketAddr::new(socket_addr.ip(), port as u16);
+                let quic = QuicClient::new().await?;
+                let server_name= ServerName::try_from("vaultDriveServer")
+                    .context("Invalid server name")?;
 
-                    quic.connection.insert(socket_addr, conn);
 
-                }
+
+                let conn = quic.endpoint
+                    .connect_with(pin_cert_client_config(cert)?, child_connect, &server_name.to_str())?
+                    .await
+                    .context("Failed to establish QUIC connection")?;
+
+                quic.connection.insert(socket_addr, conn);
             }
 
             Ok(success)
@@ -148,5 +148,6 @@ pub async fn reauthenticate(
 
 
 }
+
 
 

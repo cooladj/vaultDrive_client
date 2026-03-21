@@ -11,11 +11,14 @@ use log::debug;
 use prost::Message;
 
 use rcgen::{ CertificateParams, DistinguishedName, DnType, KeyPair};
-use rustls::RootCertStore;
+use rustls::{DigitallySignedStruct, RootCertStore};
 use tokio::io::{join, AsyncWriteExt};
 use tokio::sync::OnceCell;
 use once_cell::sync::Lazy;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
 use tracing::error;
+use crate::autoRun::{contain_cert, insert_cert};
 use crate::client::{ VAULT_DRIVE_MAP};
 use crate::commands::{connectionDirect, connectionHub};
 
@@ -35,7 +38,7 @@ pub(crate) const ZERO_ADDR: SocketAddr = SocketAddr::new(
 );
 
 ///This is currently turned off
-const DEFAULT_HUB_DNS: &str = "hub.vaultdrive.org:8443";
+const DEFAULT_HUB_DNS: &str = "hub.vaultdrive.org:443";
 
 
 static QUIC_CLIENT: OnceCell<QuicClient> = OnceCell::const_new();
@@ -56,27 +59,29 @@ impl QuicClient {
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)
             .context("Failed to create QUIC endpoint")?;
 
-        let (client_cert, client_key) = Self::generate_client_cert()?;
 
-        let mut transport = TransportConfig::default();
-        transport.max_concurrent_bidi_streams(100_u32.into());
-        transport.max_concurrent_uni_streams(100_u32.into());
-        transport.keep_alive_interval(Some(Duration::from_secs(30)));
-        transport.max_idle_timeout(Some(Duration::from_secs(90).try_into()?));
-        transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
 
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         let mut crypto = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(VaultDriveServerVerifier::new()))
-            .with_client_auth_cert(vec![client_cert], client_key)?;
-        crypto.alpn_protocols = vec![b"valuedrive".to_vec()];
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+
+        crypto.alpn_protocols = vec![b"vaultdrive".to_vec()];
 
 
         let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?
         ));
+        let mut transport = TransportConfig::default();
+        transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
         client_config.transport_config(Arc::new(transport));
+
 
         endpoint.set_default_client_config(client_config);
 
@@ -88,33 +93,7 @@ impl QuicClient {
     }
 
 
-    fn generate_client_cert() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-        let mut params = CertificateParams::new(vec!["vaultDriveClient".to_string()])
-            .context("Failed to create certificate params")?;
-
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "vaultDriveClient");
-        params.distinguished_name = dn;
-
-        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-            .context("Failed to generate key pair")?;
-
-        let cert = params.self_signed(&key_pair)
-            .context("Failed to generate client certificate")?;
-
-        let cert_der = CertificateDer::from(cert.der().to_vec());
-        let key_der = PrivateKeyDer::try_from(key_pair.serialize_der())
-            .map_err(|e| anyhow::anyhow!("Failed to serialize private key: {}", e))?;
-
-        tracing::info!("Generated client certificate with CN=vaultDriveClient");
-
-        Ok((cert_der, key_der))
-    }
-
-
-
-
-    pub async fn connect(&self, addr: &SocketAddr) -> Result<(SocketAddr,Connection)> {
+    pub async fn connect(&self, addr: &SocketAddr, tofu_enable: Option<bool>) -> Result<(SocketAddr,Connection)> {
         debug!("Connecting to {}", addr);
         match self.connection.get(addr){
             None => {}
@@ -139,9 +118,12 @@ impl QuicClient {
                 .context("Invalid server name")?
         )
         };
-
-        let connection = self.endpoint
-            .connect(addr, &server_name.to_str())?
+        let connecting = if let Some(tofu_enable) = tofu_enable {
+            self.endpoint.connect_with(tofu_client_config(tofu_enable)?, addr, &server_name.to_str())?
+        } else {
+            self.endpoint.connect(addr, &server_name.to_str())?
+        };
+        let connection = connecting
             .await
             .context("Failed to establish QUIC connection")?;
 
@@ -233,127 +215,199 @@ impl QuicClient {
 
 }
 
+pub fn pin_cert_client_config(cert:  Vec<u8>) -> Result<ClientConfig> {
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
 
+    let tofu_verifier: PinnedCertVerifier = PinnedCertVerifier{
+        expected_cert: cert,
+    };
+
+
+
+    let mut crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(tofu_verifier))
+        .with_no_client_auth();
+
+    crypto.alpn_protocols = vec![b"vaultdrive".to_vec()];
+
+
+    let mut client_config = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?
+    ));
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
+    client_config.transport_config(Arc::new(transport));
+
+    Ok(client_config)
+}
+
+
+fn tofu_client_config(tofu_enable: bool ) -> Result<ClientConfig> {
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
+
+    let tofu_verifier: TofuVerifier = TofuVerifier{
+        tofu_enabled: tofu_enable,
+    };
+
+
+
+    let mut crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(tofu_verifier))
+        .with_no_client_auth();
+
+    crypto.alpn_protocols = vec![b"vaultdrive".to_vec()];
+
+
+    let mut client_config = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?
+    ));
+    let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
+    client_config.transport_config(Arc::new(transport));
+
+    Ok(client_config)
+
+
+
+}
 
 #[derive(Debug)]
-pub struct VaultDriveServerVerifier {
-    root_store: Arc<RootCertStore>,
+pub struct TofuVerifier {
+    pub tofu_enabled: bool,
 }
 
-impl VaultDriveServerVerifier {
-    pub fn new() -> Self {
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        Self {
-            root_store: Arc::new(root_store),
-        }
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for VaultDriveServerVerifier {
+impl ServerCertVerifier for TofuVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
-        now: UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // First, try standard CA verification (for Cloudflare certs)
-        let ca_verifier = rustls::client::WebPkiServerVerifier::builder(self.root_store.clone())
-            .build()
-            .map_err(|e| {
-                tracing::debug!("Failed to build CA verifier: {}", e);
-                rustls::Error::General(format!("Verifier build failed: {}", e))
-            })?;
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let cert_bytes = end_entity.as_ref();
 
-        match ca_verifier.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        ) {
-            Ok(verified) => {
-                tracing::info!("Server certificate verified via CA chain");
-                return Ok(verified);
+        if self.tofu_enabled {
+            if contain_cert(&cert_bytes).map_err(|e| rustls::Error::General(format!("{e}")))? {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::General("Unknown certificate".into()))
             }
-            Err(ca_err) => {
-                tracing::debug!("CA verification failed: {}, trying self-signed verification", ca_err);
+        } else {
+            insert_cert(&cert_bytes).map_err(|e| rustls::Error::General(format!("{e}")))?;
+            Ok(ServerCertVerified::assertion())
+        }
+    }
 
-                // CA verification failed, try self-signed verification
-                // Parse the certificate to verify CN
-                let cert = x509_parser::parse_x509_certificate(end_entity)
-                    .map_err(|_| rustls::Error::InvalidCertificate(
-                        rustls::CertificateError::BadEncoding
-                    ))?
-                    .1;
+    fn verify_tls12_signature(
+        &self, _message: &[u8], _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
 
-                // Extract Common Name from subject
-                let subject_cn = cert.subject()
-                    .iter_common_name()
-                    .next()
-                    .and_then(|cn| cn.as_str().ok())
-                    .ok_or_else(|| rustls::Error::InvalidCertificate(
-                        rustls::CertificateError::BadEncoding
-                    ))?;
+    fn verify_tls13_signature(
+        &self, _message: &[u8], _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
 
-                // Verify CN matches expected value for self-signed
-                if subject_cn != "vaultDriveServer" {
-                    tracing::error!(
-                        "Certificate verification failed: CA validation failed and CN mismatch (expected 'vaultDriveServer', got '{}')",
-                        subject_cn
-                    );
-                    return Err(rustls::Error::InvalidCertificate(
-                        rustls::CertificateError::NotValidForName
-                    ));
-                }
-                
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
 
-                tracing::info!("Server certificate verified as self-signed: CN={}", subject_cn);
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
+
+#[derive(Debug)]
+pub struct PinnedCertVerifier {
+    expected_cert: Vec<u8>,
+}
+
+impl ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.expected_cert {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("Certificate doesn't match expected".into()))
         }
     }
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
-        )
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
     }
 
     fn verify_tls13_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
-        )
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-        ]
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[derive(Debug)]
+pub struct AcceptAllVerifier;
+
+impl ServerCertVerifier for AcceptAllVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 

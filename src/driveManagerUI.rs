@@ -278,6 +278,8 @@ impl eframe::App for DriveManagerApp {
                             username: form_data.username,
                             password: form_data.password,
                             scope_type: form_data.scope_type,
+                            tofu_enable: form_data.tofu_enable,
+                            
                         }).await {
                             Ok(_) => {
                                 match send_command_to_daemon(SocketCommand::Volumes{
@@ -658,7 +660,8 @@ struct FormData {
     system: String,
     username: String,
     password: String,
-    scope_type: ScopeType
+    scope_type: ScopeType,
+    tofu_enable: bool,
 }
 #[derive(Default)]
 struct ConnectDriveDialog {
@@ -668,6 +671,7 @@ struct ConnectDriveDialog {
     system: String,
     username: String,
     password: String,
+    tofu_enabled: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, Display)]
 pub enum ConnectionType {
@@ -837,6 +841,7 @@ impl ConnectDriveDialog {
                                 username: self.username.clone(),
                                 password: self.password.clone(),
                                 scope_type: self.scope.clone(),
+                                tofu_enable: self.tofu_enabled.clone()
 
 
                             });

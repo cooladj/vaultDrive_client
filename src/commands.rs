@@ -11,17 +11,20 @@ use interprocess::local_socket;
 use interprocess::local_socket::{GenericFilePath, ToFsName};
 use interprocess::local_socket::traits::tokio::Stream;
 use log::debug;
+use rustls::ClientConfig;
+use rustls::pki_types::ServerName;
 use tokio::join;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use serde::{Deserialize, Serialize};
+use tokio_rustls::TlsConnector;
 use winreg::types::ToRegValue;
 use crate::autoRun::{connection, get_scope, insert_mount, mounts, remove_connection, remove_mount, update_scope};
 use crate::client::{VAULT_DRIVE_MAP, VaultDriveClient};
 use crate::driveManagerUI::{Connection, ConnectionType, Drive, ScopeType};
 use crate::filesystem::{mount_to_UI_tuple};
-use crate::network::ZERO_ADDR;
+use crate::network::{AcceptAllVerifier, ZERO_ADDR};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum SocketCommand {
@@ -31,7 +34,8 @@ pub enum SocketCommand {
         connection_point:String,
         username: String,
         password: String,
-        scope_type: ScopeType
+        scope_type: ScopeType,
+        tofu_enable: bool,
     },
     UnMount {
         mount_point: String,
@@ -82,7 +86,7 @@ pub enum CommandResponse {
 
 pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
     match command {
-        SocketCommand::Connect { connection_type: connection_method, connection_point,username, password, scope_type} => {
+        SocketCommand::Connect { connection_type: connection_method, connection_point,username, password, scope_type, tofu_enable} => {
 
 
           let operation =  if connection_method == ConnectionType::Direct{
@@ -91,9 +95,9 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
                   Err(e) => return CommandResponse::Error(e.to_string()),
               };
 
-                  connectionDirect(sockerAdder, username.as_str(),password, scope_type).await
+                  connectionDirect(sockerAdder, username.as_str(),password, scope_type, tofu_enable).await
             }else {
-              connectionHub( &*connection_point, username.as_str(),password, scope_type).await
+              connectionHub( &*connection_point, username.as_str(),password, scope_type, tofu_enable).await
           };
           match operation {
               Ok(socket_addr) => CommandResponse::Success(ResponseData::Text(socket_addr.to_string())),
@@ -152,6 +156,17 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
 }
 
 pub async fn send_command_to_daemon(command: SocketCommand) -> Result<CommandResponse> {
+
+    let client_config = ClientConfig::builder()
+        .dangerous()
+
+        .with_custom_certificate_verifier(Arc::new(AcceptAllVerifier))
+        .with_no_client_auth();
+    let server_name = ServerName::try_from("localhost")?;
+    let connector = TlsConnector::from(Arc::new(client_config));
+
+
+
     #[cfg(unix)]
     let path_str = "/tmp/vaultDriveClient.sock";
 
@@ -161,7 +176,7 @@ pub async fn send_command_to_daemon(command: SocketCommand) -> Result<CommandRes
     let name = path_str.to_fs_name::<GenericFilePath>()?;
 
     let stream = match local_socket::tokio::Stream::connect(name).await {
-        Ok(stream) => stream,
+        Ok(stream) => connector.connect(server_name, stream).await?,
         Err(e) => {
             tracing::debug!("Failed to connect to daemon: {:?}", e.kind());
             return Ok(CommandResponse::Error(e.to_string()));
@@ -434,24 +449,25 @@ pub async fn execute_get_ui_connections(user_id: String, elevated: bool) -> Resu
 }
 
 
-pub async fn connectionDirect( server: SocketAddr, username: &str, password: String, scope_type: ScopeType) -> Result<SocketAddr> {
+pub async fn connectionDirect( server: SocketAddr, username: &str, password: String, scope_type: ScopeType, tofu_enable: bool) -> Result<SocketAddr> {
     tracing::debug!("Connecting to Direct Vault Drive for user {:?} socketaddr {:?}", username, server);
     let client = VaultDriveClient::new(server, username.parse()?, scope_type.to_string()).await?;
 
-    let server_addr = client.connect(&username, password, None).await?;
+    let server_addr = client.connect(&username, password, None, tofu_enable).await?;
     
     
     Ok(server_addr)
 }
-pub async fn connectionHub( hostname: &str, username: &str,  password: String, scope_type: ScopeType) -> Result<SocketAddr> {
+pub async fn connectionHub( hostname: &str, username: &str,  password: String, scope_type: ScopeType, tofu_enable: bool) -> Result<SocketAddr> {
     tracing::debug!("Connecting to hub Vault Drive for user {:?} ", username );
 
     //this is just used to make it default could make it an optional
     //but this should be the only time it is it really need an empty
     let defaultSockerAddr: SocketAddr = ZERO_ADDR;
     let client = VaultDriveClient::new(defaultSockerAddr, username.parse()?, scope_type.to_string()).await?;
-    client.connect_to_hub( hostname).await?;
-    let server_addr = client.connect(username, password, Some(hostname.to_string())).await?;
+     client.connect_to_hub( hostname).await?;
+    let server_addr =  client.connect(username, password, Some(hostname.to_string()), tofu_enable ).await?;
+
 
     
 
