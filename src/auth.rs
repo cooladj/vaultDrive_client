@@ -5,7 +5,7 @@ use crate::network::{pin_cert_client_config, read_message, write_message, QuicCl
 use crate::proto::vaultdrive::*;
 use quinn::{ RecvStream, SendStream};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use crate::commands::connectionDirect;
+use crate::commands::connection_direct;
 use crate::proto::vaultdrive::response::ResponseType;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
@@ -88,15 +88,13 @@ pub async fn authenticate(
 pub async fn reauthenticate(
     send: &mut SendStream,
     recv: &mut RecvStream,
-    username: String,
+    username: &str,
     connection_type: ConnectionType,
-    connection_point: String,
+    connection_point: &str,
     socket_addr:SocketAddr,
-    scope: String
+    scope: &str
 ) -> Result<AuthenticationSuccessResponse> {
-    let username_clone = username.clone();
-    let connection_point_clone = connection_point.clone();
-    let connection = get_connection_from_db(connection_type, connection_point_clone, username_clone, scope)
+    let connection = get_connection_from_db(connection_type, connection_point, username, scope)
     .await?;
 
     let init_req = Request {
@@ -107,6 +105,7 @@ pub async fn reauthenticate(
             },
         )),
     };
+    write_message(send, &init_req).await?;
 
 
     let auth_response: Response = read_message(recv).await

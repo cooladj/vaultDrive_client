@@ -13,8 +13,8 @@ message HubRequest {
     NatPokeResponse nat_poke_res = 9;
     HealthCheckRequest health_req = 10;
     HealthCheckResponse health_res = 11;
-    CreateCheckoutSessionRequest checkout_req = 12;
-    CreateCheckoutSessionResponse checkout_res = 13;
+    SubscriptionRequest subscription_req = 12;
+    SubscriptionResponse subscription_res = 13;
     ClientHelloRequest client_hello_req = 14;
     ClientHelloResponse client_hello_res = 15;
     SetHostNameRequest set_hostname_req= 16;
@@ -23,7 +23,8 @@ message HubRequest {
     DisconnectRequest disconnect_req=19;
     GetHostNameRequest get_hostname_req =20;
     GetHostNameResponse get_hostname_res =21;
-
+    ClientRelayRequest client_relay_req= 22;
+    ClientRelayResponse client_relay_res =23;
   }
 }
 
@@ -83,15 +84,29 @@ message HealthCheckResponse {
 }
 
 
-message CreateCheckoutSessionRequest {
+message SubscriptionRequest {
   string id = 1;
 }
 
-message CreateCheckoutSessionResponse {
-  string checkout_url = 1;
-  string id = 2;
-  bool new = 3;
+message SubscriptionResponse {
+  string device_id = 1;
+
+  oneof response {
+    PricingListResponse pricing_list = 2;
+    CustomerPortalResponse customer_portal = 3;
+  }
 }
+
+message PricingListResponse {
+  repeated PriceListItem items = 1;
+
+}
+message CustomerPortalResponse{
+  string url =1;
+}
+
+
+
 
 message ClientHelloRequest {
   string unique_id = 1;
@@ -103,6 +118,17 @@ message ClientHelloResponse {
   optional string socket_addr = 2;
   optional string secondary_socket_addr = 3;
 }
+message ClientRelayRequest {
+  string Hostname =1;
+
+}
+message ClientRelayResponse{
+  optional bytes token = 1;
+}
+
+
+
+
 
 message NotifyRequest {
   string id = 1;
@@ -111,4 +137,15 @@ message NotifyRequest {
 
 message DisconnectRequest{
   uint64 time=1;
+}
+
+message PriceListItem {
+  string name = 1;
+  string description = 2;
+  repeated PriceDetail prices = 3;
+}
+
+message PriceDetail {
+  string url = 1;
+  string amount = 2;
 }

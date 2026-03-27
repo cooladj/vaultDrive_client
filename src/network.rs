@@ -1,8 +1,12 @@
+use std::io;
+use std::io::IoSliceMut;
 use anyhow::{Context, Result, bail, anyhow};
-use quinn::{Connection, Endpoint, RecvStream, SendStream, ClientConfig, TransportConfig, congestion};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, ClientConfig, TransportConfig, congestion, AsyncUdpSocket, UdpPoller};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use bytes::{BufMut, BytesMut};
 use dashmap::{DashMap, Equivalent};
@@ -15,17 +19,18 @@ use rustls::{DigitallySignedStruct, RootCertStore};
 use tokio::io::{join, AsyncWriteExt};
 use tokio::sync::OnceCell;
 use once_cell::sync::Lazy;
+use quinn::udp::{RecvMeta, Transmit};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
 use tracing::error;
 use crate::autoRun::{contain_cert, insert_cert};
 use crate::client::{ VAULT_DRIVE_MAP};
-use crate::commands::{connectionDirect, connectionHub};
+use crate::commands::{connection_direct};
 
 pub struct QuicClient {
     pub(crate) endpoint: Endpoint,
     pub connection: DashMap<SocketAddr,Connection>,
-    pub reAuth: tokio::sync::Notify
+    pub reAuth: tokio::sync::Notify,
 
 }
 
@@ -47,43 +52,54 @@ static QUIC_CLIENT: OnceCell<QuicClient> = OnceCell::const_new();
 
 impl QuicClient {
 
-        pub async fn new() -> Result<&'static Self> {
-            QUIC_CLIENT
-                .get_or_try_init(|| async {
-                    Self::initialize().await
-                })
-                .await
-        }
+    pub async fn new() -> Result<&'static Self> {
+        tracing::debug!("QuicClient::new called, initialized: {}", QUIC_CLIENT.initialized());
+        let result = QUIC_CLIENT
+            .get_or_try_init(|| async {
+                tracing::debug!("QuicClient starting initialize");
+                let r = Self::initialize().await;
+                tracing::debug!("QuicClient initialize complete: {}", r.is_ok());
+                r
+            })
+            .await;
+        tracing::debug!("QuicClient::new returning");
+        result
+    }
     async fn initialize() -> Result<Self> {
-
+        tracing::debug!("initialize: creating endpoint");
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)
             .context("Failed to create QUIC endpoint")?;
-
-
-
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        tracing::debug!("initialize: endpoint created");
 
         let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        tracing::debug!("root_store: created empty");
+
+        let roots: Vec<_> = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+        tracing::debug!("root_store: collected {} roots", roots.len());
+
+        root_store.extend(roots);
+
+        tracing::debug!("building root_store");
 
         let mut crypto = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-
         crypto.alpn_protocols = vec![b"vaultdrive".to_vec()];
-
+        tracing::debug!("initialize: crypto config built");
 
         let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?
         ));
+        tracing::debug!("initialize: client config created");
+
         let mut transport = TransportConfig::default();
         transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
         client_config.transport_config(Arc::new(transport));
-
+        tracing::debug!("initialize: transport config set");
 
         endpoint.set_default_client_config(client_config);
+        tracing::debug!("initialize: complete, returning Self");
 
         Ok(Self {
             endpoint,
@@ -93,12 +109,15 @@ impl QuicClient {
     }
 
 
-    pub async fn connect(&self, addr: &SocketAddr, tofu_enable: Option<bool>) -> Result<(SocketAddr,Connection)> {
+
+    pub async fn connect(&self, addr: &SocketAddr, tofu_enable: Option<bool>, token: Option<Vec<u8>>, relay_socket_addr: Option<SocketAddr>) -> Result<(SocketAddr,Connection)> {
         debug!("Connecting to {}", addr);
-        match self.connection.get(addr){
-            None => {}
-            Some(conn) => {
+        if !relay_socket_addr.is_some() {
+            match self.connection.get(addr) {
+                None => {}
+                Some(conn) => {
                     return Ok((conn.remote_address(), conn.value().clone()));
+                }
             }
         }
 
@@ -119,7 +138,7 @@ impl QuicClient {
         )
         };
         let connecting = if let Some(tofu_enable) = tofu_enable {
-            self.endpoint.connect_with(tofu_client_config(tofu_enable)?, addr, &server_name.to_str())?
+            self.endpoint.connect_with(tofu_client_config(tofu_enable, token)?, addr, &server_name.to_str())?
         } else {
             self.endpoint.connect(addr, &server_name.to_str())?
         };
@@ -129,11 +148,17 @@ impl QuicClient {
 
 
         tracing::info!("Connected to {} via QUIC", addr);
+        if let Some(relay_socket_addr) = relay_socket_addr {
+            self.connection.insert(relay_socket_addr, connection.clone());
 
-        self.connection.insert(addr, connection.clone());
+
+            Ok((relay_socket_addr, connection))
+        }else {
+            self.connection.insert(addr, connection.clone());
 
 
-        Ok((addr, connection))
+            Ok((addr, connection))
+        }
     }
 
 
@@ -244,7 +269,7 @@ pub fn pin_cert_client_config(cert:  Vec<u8>) -> Result<ClientConfig> {
 }
 
 
-fn tofu_client_config(tofu_enable: bool ) -> Result<ClientConfig> {
+fn tofu_client_config(tofu_enable: bool, token: Option<Vec<u8>> ) -> Result<ClientConfig> {
     let mut transport = TransportConfig::default();
     transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
 
@@ -268,6 +293,12 @@ fn tofu_client_config(tofu_enable: bool ) -> Result<ClientConfig> {
     let mut transport = TransportConfig::default();
     transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
     client_config.transport_config(Arc::new(transport));
+    if let Some(token) = token {
+
+        client_config.initial_dst_cid_provider(Arc::new(move || {
+            quinn::ConnectionId::new(&token)
+        }));
+    }
 
     Ok(client_config)
 
@@ -291,7 +322,7 @@ impl ServerCertVerifier for TofuVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         let cert_bytes = end_entity.as_ref();
 
-        if self.tofu_enabled {
+        if !self.tofu_enabled {
             if contain_cert(&cert_bytes).map_err(|e| rustls::Error::General(format!("{e}")))? {
                 Ok(ServerCertVerified::assertion())
             } else {

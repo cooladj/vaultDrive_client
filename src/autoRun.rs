@@ -23,10 +23,11 @@ pub struct mounts {
 }
 
 async fn get_connection() -> anyhow::Result<SqliteConnection> {
-    Ok(SqliteConnection::connect("sqlite:database.db?mode=rwc").await?)
+    Ok(SqliteConnection::connect("sqlite:vaultDrive_client.db?mode=rwc").await?)
 }
+// Sync rusqlite - uses file path (not connection string)
 fn get_connection_sync() -> anyhow::Result<rusqlite::Connection> {
-    Ok(rusqlite::Connection::open("sqlite:database.db?mode=rwc")?)
+    Ok(rusqlite::Connection::open("vaultDrive_client.db")?)
 }
 
 pub async fn insert_connection(connection: connection) -> anyhow::Result<()> {
@@ -93,9 +94,9 @@ pub async fn remove_mount(
 
 pub async fn get_connection_from_db(
     connection_type: ConnectionType,
-    connection_point: String,
-    username: String,
-    scope: String,
+    connection_point: &str,
+    username: &str,
+    scope: &str,
 ) -> anyhow::Result<connection> {
     let mut conn = get_connection().await?;
 
@@ -114,9 +115,9 @@ pub async fn get_connection_from_db(
     Ok(connection {
         connection_id: row.get("id"),
         connection_type,
-        connection_point,
-        username,
-        scope,
+        connection_point: connection_point.to_string(),
+        username: username.to_string(),
+        scope: scope.to_string(),
         key: row.get("key"),
         mounts: None,
     })
@@ -125,7 +126,7 @@ pub async fn get_connection_from_db(
 pub async fn remove_connection(
     connection_type: ConnectionType,
     connection_point: String,
-    username: String,
+    username: &str,
 ) -> anyhow::Result<Option<String>> {
     let mut conn = get_connection().await?;
     let mut tx = conn.begin().await?;

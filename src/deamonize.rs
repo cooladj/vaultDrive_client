@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::scope;
-use anyhow::Context;
+use anyhow::{anyhow, Context};
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt, TryFutureExt};
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName, };
 use interprocess::local_socket::traits::tokio::{Listener, };
@@ -17,9 +18,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use service_manager::*;
 use tokio_rustls::TlsAcceptor;
+use windows::Win32::Security::PSID;
+use windows::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use crate::autoRun::{init_db, get_connections_with_mounts};
 use crate::client::VaultDriveClient;
-use crate::commands::{connectionDirect, connectionHub, execute_socket_command, CommandResponse, ResponseData, SocketCommand};
+use crate::commands::{connection_direct,  execute_socket_command, CommandResponse, ResponseData, SocketCommand};
 use crate::driveManagerUI::ConnectionType;
 use crate::network::ZERO_ADDR;
 pub const SERVICE_NAME: &str = "com.vaultDrive_client.service";
@@ -177,76 +180,60 @@ pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
 
         for connection in connections {
             tokio::spawn(async move {
-                let client = if connection.connection_type == ConnectionType::Direct {
-                    let socket_addr: SocketAddr = match connection.connection_point.parse() {
-                        Ok(socket) => socket,
-                        Err(e) => {
-                            tracing::error!("Failed to parse socket address: {}", e);
-                            return;
+                let result = async {
+                    let (client, hostname_option) = match connection.connection_type {
+                        ConnectionType::Direct => {
+                            let socket_addr: SocketAddr = connection.connection_point.parse()?;
+                            let client =
+                                VaultDriveClient::new(socket_addr, connection.username.clone(), connection.scope).await?;
+                            client.try_connect_or_relay(false, &connection.connection_point).await?;
+                            (client, None)
+                        }
+                        ConnectionType::Hub => {
+                            let client =
+                                VaultDriveClient::new(ZERO_ADDR, connection.username.clone(), connection.scope).await?;
+
+                            let hub_addr = client.connect_to_hub().await?;
+                            client.get_server_from_hub(&connection.connection_point, hub_addr).await?;
+                            client.try_connect_or_relay(false, &connection.connection_point).await?;
+                            (client, Some(connection.connection_point))
                         }
                     };
-                    match VaultDriveClient::new(socket_addr, connection.username, connection.scope).await {
-                        Ok(client) => client,
-                        Err(e) => {
-                            tracing::error!("Failed to create client: {}", e);
-                            return;
-                        }
-                    }
-                } else {
-                    let default_socket_addr: SocketAddr = ZERO_ADDR;
-                    let client = match VaultDriveClient::new(default_socket_addr, connection.username, connection.scope).await {
-                        Ok(client) => client,
-                        Err(e) => {
-                            tracing::error!("Failed to create hub client: {}", e);
-                            return;
-                        }
-                    };
-                    if let Err(e) = client.connect_to_hub(connection.connection_point.as_str()).await {
-                        tracing::error!("Failed to connect to hub: {}", e);
-                        return;
-                    }
+
                     client
-                };
+                        .reauthenticate(hostname_option.as_deref(), connection.username.as_str())
+                        .await
+                        .context("Reauthentication failed")?;
 
-                let session = client.session.read().await
-                    .as_ref()
-                    .expect("Session is None")
-                    .clone();
-
-                if let Err(e) = client.reauthenticate(session).await {
-                    tracing::error!("Reauthentication failed: {}", e);
-                    return;
-                }
-
-                if let Some(mounts) = connection.mounts {
-                    for mount in mounts {
-                        if let Err(e) = crate::filesystem::mount(
-                            client.clone(),
-                            mount.host_drive.as_str(),
-                            mount.mount_point.as_str(),
-                            mount.scope,
-                        )
-                            .await
-                        {
-                            tracing::error!("Failed to mount {}: {}", mount.host_drive, e);
+                    if let Some(mounts) = connection.mounts {
+                        for mount in mounts {
+                            if let Err(e) = crate::filesystem::mount(
+                                Arc::clone(&client),
+                                mount.host_drive.as_str(),
+                                mount.mount_point.as_str(),
+                                mount.scope,
+                            )
+                                .await
+                            {
+                                tracing::error!("Failed to mount {}: {}", mount.host_drive, e);
+                            }
                         }
                     }
+
+                    Ok::<_, anyhow::Error>(())
+                }
+                    .await;
+
+                if let Err(e) = result {
+                    tracing::error!("Connection failed for {}: {}", connection.username, e);
                 }
             });
         }
     });
 
-    let (cert_der, key_der) = generate_server_cert()?;
+    generate_and_save_keypair()?;
 
-    let cert = CertificateDer::from(cert_der);
-    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key_der));
-
-    let server_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)?;
-
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
-
+    let static_key = std::fs::read(DAEMON_PRIV_KEY_PATH)?;
 
     #[cfg(unix)]
     let path_str = "/tmp/vaultDriveClient.sock";
@@ -256,60 +243,115 @@ pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
 
     let name = path_str.to_fs_name::<GenericFilePath>()?;
 
-
-
     let listener = ListenerOptions::new()
         .name(name)
         .reclaim_name(true)
         .try_overwrite(true)
         .create_tokio()?;
 
-
     info!("Daemon listening on {}", path_str);
 
     loop {
         let stream = match listener.accept().await {
-            Ok(s) =>     acceptor.accept(s).await?
-            ,
+            Ok(s) => s,
             Err(e) => {
                 warn!("Failed to accept connection: {}", e);
                 continue;
             }
         };
 
+        let static_key = static_key.clone();
         tokio::spawn(async move {
-            handle_client(stream).await;
+            let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+
+            let noise = match noise_handshake(&mut framed, &static_key).await {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("Handshake failed: {}", e);
+                    return;
+                }
+            };
+
+            handle_client(framed, noise).await;
         });
     }
 }
-pub fn generate_server_cert() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    let cn = format!("vaultdrive-{}", uuid::Uuid::new_v4());
+const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
+#[cfg(unix)]
+const DAEMON_PRIV_KEY_PATH: &str = "/etc/vaultdrive/daemon.key";
+#[cfg(unix)]
+const DAEMON_PUB_KEY_PATH: &str = "/etc/vaultdrive/daemon.pub";
 
-    let mut params = CertificateParams::new(vec![cn.clone()])
-        .context("Failed to create certificate params")?;
+#[cfg(windows)]
+const DAEMON_PRIV_KEY_PATH: &str = r"C:\ProgramData\VaultDrive\daemon.key";
+#[cfg(windows)]
+const DAEMON_PUB_KEY_PATH: &str = r"C:\ProgramData\VaultDrive\daemon.pub";
 
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, &cn);
-    params.distinguished_name = dn;
+pub fn generate_and_save_keypair() -> anyhow::Result<()> {
+    if std::path::Path::new(DAEMON_PUB_KEY_PATH).exists()
+        && std::path::Path::new(DAEMON_PRIV_KEY_PATH).exists()
+    {
+        return Ok(());
+    }
 
-    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-        .context("Failed to generate key pair")?;
+    // Create the directory if it doesn't exist
+    if let Some(parent) = std::path::Path::new(DAEMON_PRIV_KEY_PATH).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
-    let cert = params.self_signed(&key_pair)
-        .context("Failed to generate server certificate")?;
+    let builder = snow::Builder::new(NOISE_PATTERN.parse()?);
+    let keypair = builder.generate_keypair()?;
 
-    let cert_der = cert.der().to_vec();
-    let key_der = key_pair.serialize_der();
+    std::fs::write(DAEMON_PUB_KEY_PATH, &keypair.public)?;
+    save_private_key(DAEMON_PRIV_KEY_PATH, &keypair.private)?;
 
-    info!("Generated server certificate with CN={}", cn);
+    Ok(())
+}
+#[cfg(unix)]
+fn save_private_key(path: &str, data: &[u8]) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::io::Write;
 
-    Ok((cert_der, key_der))
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(data)?;
+    Ok(())
 }
 
-async fn handle_client(stream: impl AsyncReadExt + AsyncWriteExt + Unpin ){
-    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+#[cfg(windows)]
+fn save_private_key(path: &str, data: &[u8]) -> anyhow::Result<()> {
+    std::fs::write(path, data)?;
 
-    let command_bytes = match framed.next().await {
+    fn icacls(path: &str, args: &[&str]) -> anyhow::Result<()> {
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("icacls failed: {}", stderr);
+        }
+        Ok(())
+    }
+
+    icacls(path, &["/inheritance:r"])?;
+    icacls(path, &["/grant:r", "SYSTEM:(R)"])?;
+    icacls(path, &["/grant:r", "Administrators:(R)"])?;
+
+    Ok(())
+}
+
+async fn handle_client(
+    mut framed: Framed<impl AsyncReadExt + AsyncWriteExt + Unpin, LengthDelimitedCodec>,
+    mut noise: snow::TransportState,
+) {
+    let mut buf = vec![0u8; 65535];
+
+    let encrypted = match framed.next().await {
         Some(Ok(bytes)) => bytes,
         Some(Err(e)) => {
             warn!("Failed to read command: {}", e);
@@ -321,13 +363,23 @@ async fn handle_client(stream: impl AsyncReadExt + AsyncWriteExt + Unpin ){
         }
     };
 
-    let (command) = match postcard::from_bytes(&command_bytes) {
+    let len = match noise.read_message(&encrypted, &mut buf) {
+        Ok(len) => len,
+        Err(e) => {
+            warn!("Failed to decrypt command: {}", e);
+            return;
+        }
+    };
+
+    let command: SocketCommand = match postcard::from_bytes(&buf[..len]) {
         Ok(cmd) => cmd,
         Err(e) => {
             warn!("Failed to deserialize command: {}", e);
             let error_response = CommandResponse::Error(format!("Deserialization error: {}", e));
             if let Ok(response_bytes) = postcard::to_allocvec(&error_response) {
-                let _ = framed.send(response_bytes.into()).await;
+                if let Ok(enc_len) = noise.write_message(&response_bytes, &mut buf) {
+                    let _ = framed.send(Bytes::copy_from_slice(&buf[..enc_len])).await;
+                }
             }
             return;
         }
@@ -343,7 +395,35 @@ async fn handle_client(stream: impl AsyncReadExt + AsyncWriteExt + Unpin ){
         }
     };
 
-    if let Err(e) = framed.send(response_bytes.into()).await {
-        warn!("Failed to write response: {}", e);
+    match noise.write_message(&response_bytes, &mut buf) {
+        Ok(len) => {
+            if let Err(e) = framed.send(Bytes::copy_from_slice(&buf[..len])).await {
+                warn!("Failed to write response: {}", e);
+            }
+        }
+        Err(e) => {
+            warn!("Failed to encrypt response: {}", e);
+        }
     }
 }
+
+async fn noise_handshake(
+    framed: &mut Framed<impl AsyncReadExt + AsyncWriteExt + Unpin, LengthDelimitedCodec>,
+    static_key: &[u8],
+) -> anyhow::Result<snow::TransportState> {
+    let mut buf = vec![0u8; 65535];
+
+    let mut responder = snow::Builder::new(NOISE_PATTERN.parse()?)
+        .local_private_key(static_key)?
+        .build_responder()?;
+
+    let msg = framed.next().await
+        .ok_or_else(|| anyhow!("No handshake message"))??;
+    responder.read_message(&msg, &mut buf)?;
+
+    let len = responder.write_message(&[], &mut buf)?;
+    framed.send(Bytes::copy_from_slice(&buf[..len])).await?;
+
+    Ok(responder.into_transport_mode()?)
+}
+

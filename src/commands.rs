@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::fs;
 use tracing;
 use std::time::Duration;
+use bytes::Bytes;
 use egui::TextBuffer;
 use futures::{SinkExt, StreamExt};
 use futures::future::join_all;
@@ -20,6 +21,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use serde::{Deserialize, Serialize};
 use tokio_rustls::TlsConnector;
 use winreg::types::ToRegValue;
+use crate::auth::session;
 use crate::autoRun::{connection, get_scope, insert_mount, mounts, remove_connection, remove_mount, update_scope};
 use crate::client::{VAULT_DRIVE_MAP, VaultDriveClient};
 use crate::driveManagerUI::{Connection, ConnectionType, Drive, ScopeType};
@@ -95,9 +97,9 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
                   Err(e) => return CommandResponse::Error(e.to_string()),
               };
 
-                  connectionDirect(sockerAdder, username.as_str(),password, scope_type, tofu_enable).await
+                  connection_direct(sockerAdder, username.as_str(), password, scope_type, tofu_enable).await
             }else {
-              connectionHub( &*connection_point, username.as_str(),password, scope_type, tofu_enable).await
+              connection_hub( &*connection_point, username.as_str(),password, scope_type, tofu_enable).await
           };
           match operation {
               Ok(socket_addr) => CommandResponse::Success(ResponseData::Text(socket_addr.to_string())),
@@ -154,29 +156,24 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
         _ => CommandResponse::Error("Invalid command".to_string()),
     }
 }
+const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
+#[cfg(unix)]
+const DAEMON_PUB_KEY_PATH: &str = "/etc/vaultdrive/daemon.pub";
+
+#[cfg(windows)]
+const DAEMON_PUB_KEY_PATH: &str = r"C:\ProgramData\VaultDrive\daemon.pub";
+const TIMEOUT_SECS: u64 = 5;
 
 pub async fn send_command_to_daemon(command: SocketCommand) -> Result<CommandResponse> {
-
-    let client_config = ClientConfig::builder()
-        .dangerous()
-
-        .with_custom_certificate_verifier(Arc::new(AcceptAllVerifier))
-        .with_no_client_auth();
-    let server_name = ServerName::try_from("localhost")?;
-    let connector = TlsConnector::from(Arc::new(client_config));
-
-
-
     #[cfg(unix)]
     let path_str = "/tmp/vaultDriveClient.sock";
-
     #[cfg(windows)]
     let path_str = r"\\.\pipe\vaultDriveClient";
 
     let name = path_str.to_fs_name::<GenericFilePath>()?;
 
     let stream = match local_socket::tokio::Stream::connect(name).await {
-        Ok(stream) => connector.connect(server_name, stream).await?,
+        Ok(s) => s,
         Err(e) => {
             tracing::debug!("Failed to connect to daemon: {:?}", e.kind());
             return Ok(CommandResponse::Error(e.to_string()));
@@ -185,27 +182,50 @@ pub async fn send_command_to_daemon(command: SocketCommand) -> Result<CommandRes
 
     let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
 
-    let command_bytes = postcard::to_allocvec(&command)?;
-    timeout(
-        Duration::from_secs(5),
-        framed.send(command_bytes.into())
-    )
-        .await
-        .map_err(|_| anyhow!("Write timed out"))??;
+    let daemon_pub = std::fs::read(DAEMON_PUB_KEY_PATH)?;
+    let params: snow::params::NoiseParams = NOISE_PATTERN.parse()?;
+    let mut initiator = snow::Builder::new(params)
+        .remote_public_key(&daemon_pub)?
+        .build_initiator()?;
 
-    // Read response with timeout
-    let response_bytes = timeout(
-        Duration::from_secs(5),
+    let mut buf = vec![0u8; 65535];
+
+    // -> e, es
+    let len = initiator.write_message(&[], &mut buf)?;
+    timeout(
+        Duration::from_secs(TIMEOUT_SECS),
+        framed.send(Bytes::copy_from_slice(&buf[..len]))
+    ).await.map_err(|_| anyhow!("Handshake write timed out"))??;
+
+    // <- e, ee
+    let msg = timeout(
+        Duration::from_secs(TIMEOUT_SECS),
         framed.next()
-    )
-        .await
+    ).await
+        .map_err(|_| anyhow!("Handshake read timed out"))?
+        .ok_or_else(|| anyhow!("Connection closed during handshake"))??;
+    initiator.read_message(&msg, &mut buf)?;
+
+    let mut noise = initiator.into_transport_mode()?;
+
+    // --- Send encrypted command ---
+    let command_bytes = postcard::to_allocvec(&command)?;
+    let len = noise.write_message(&command_bytes, &mut buf)?;
+    timeout(
+        Duration::from_secs(TIMEOUT_SECS),
+        framed.send(Bytes::copy_from_slice(&buf[..len]))
+    ).await.map_err(|_| anyhow!("Write timed out"))??;
+
+    // --- Read encrypted response ---
+    let encrypted = timeout(
+        Duration::from_secs(TIMEOUT_SECS),
+        framed.next()
+    ).await
         .map_err(|_| anyhow!("Read timed out"))?
         .ok_or_else(|| anyhow!("Connection closed"))??;
 
-    // Deserialize response
-    let (response) = postcard::from_bytes(
-        &response_bytes,
-    )?;
+    let len = noise.read_message(&encrypted, &mut buf)?;
+    let response: CommandResponse = postcard::from_bytes(&buf[..len])?;
 
     Ok(response)
 }
@@ -232,40 +252,6 @@ pub async fn execute_unmount(mount_point: String, server: SocketAddr, username:S
             remove_mount(connection_type, &connection_point, &username, &mount_point).await?;
     }
 
-    Ok(())
-}
-pub async fn execute_set_auto_mount(mount_point: String, server: SocketAddr, username:String, drive: String) -> Result<()>{
-    let client = VAULT_DRIVE_MAP
-        .get(&(server, username.to_string()))
-        .map(|entry| entry.clone())
-        .ok_or_else(|| anyhow!("Client not found"))?;
-
-
-    let (connection_type, connection_point) = client.session.read().await
-        .as_ref()
-        .and_then(|session| session.hostname.as_ref())
-        .map(|hostname| (ConnectionType::Hub, hostname.clone()))
-        .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
-
-        insert_mount(connection_type,&connection_point,&username,&mount_point,&drive).await?;
-
-    Ok(())
-}
-
-pub async fn execute_un_auto_mount(drive:  String, server: SocketAddr, username:String) -> Result<()>{
-    let client = VAULT_DRIVE_MAP
-        .get(&(server, username.to_string()))
-        .map(|entry| entry.clone())
-        .ok_or_else(|| anyhow!("Client not found"))?;
-
-
-
-    let (connection_type, connection_point) = client.session.read().await
-        .as_ref()
-        .and_then(|session| session.hostname.as_ref())
-        .map(|hostname| (ConnectionType::Hub, hostname.clone()))
-        .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
-        remove_mount(connection_type, &connection_point, &username, &drive).await?;
     Ok(())
 }
 
@@ -320,7 +306,7 @@ pub async fn execute_disconnect(username: String, server: SocketAddr) -> Result<
         .map(|hostname| (ConnectionType::Hub, hostname.clone()))
         .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
 
-   if let Some(connection_id) = remove_connection(connection_type, connection_point, username).await?{
+   if let Some(connection_id) = remove_connection(connection_type, connection_point, &username).await?{
         client.1.disconnect(connection_id).await?;
 
     };
@@ -449,30 +435,72 @@ pub async fn execute_get_ui_connections(user_id: String, elevated: bool) -> Resu
 }
 
 
-pub async fn connectionDirect( server: SocketAddr, username: &str, password: String, scope_type: ScopeType, tofu_enable: bool) -> Result<SocketAddr> {
+pub async fn connection_direct(server: SocketAddr, username: &str, password: String, scope_type: ScopeType, tofu_enable: bool) -> Result<SocketAddr> {
     tracing::debug!("Connecting to Direct Vault Drive for user {:?} socketaddr {:?}", username, server);
-    let client = VaultDriveClient::new(server, username.parse()?, scope_type.to_string()).await?;
+    let client = VaultDriveClient::new(server, username.parse()?, scope_type.to_string())
+        .await.inspect_err(|e| tracing::error!("VaultDriveClient::new failed: {:?}", e))?;
+    tracing::debug!("Client was made");
+    let server_addr = client.connect(&username, tofu_enable).await?;
 
-    let server_addr = client.connect(&username, password, None, tofu_enable).await?;
+    let authenticate_request = client.authenticate_internal(username, password, None).await
+        .context("Authentication failed")?;
+
+
+    let session : session = session{
+        hostname: None,
+        authenticate_request,
+    };
+
+
+    *client.session.write().await = Some(session.clone());
+
+    VAULT_DRIVE_MAP.insert((server_addr, session.authenticate_request.user_id), client);
+    tracing::debug!("{:?} this is the VAULT DRIVE CLIENT MAP", VAULT_DRIVE_MAP.len());
     
     
     Ok(server_addr)
 }
-pub async fn connectionHub( hostname: &str, username: &str,  password: String, scope_type: ScopeType, tofu_enable: bool) -> Result<SocketAddr> {
-    tracing::debug!("Connecting to hub Vault Drive for user {:?} ", username );
+pub async fn connection_hub(
+    hostname: &str,
+    username: &str,
+    password: String,
+    scope_type: ScopeType,
+    tofu_enable: bool,
+) -> Result<SocketAddr> {
+    tracing::debug!("Connecting to hub Vault Drive for user {:?}", username);
 
-    //this is just used to make it default could make it an optional
-    //but this should be the only time it is it really need an empty
-    let defaultSockerAddr: SocketAddr = ZERO_ADDR;
-    let client = VaultDriveClient::new(defaultSockerAddr, username.parse()?, scope_type.to_string()).await?;
-     client.connect_to_hub( hostname).await?;
-    let server_addr =  client.connect(username, password, Some(hostname.to_string()), tofu_enable ).await?;
+    let client = Arc::new(
+        VaultDriveClient::new(ZERO_ADDR, username.parse()?, scope_type.to_string()).await?
+    );
 
+    // 1. Connect to hub and resolve the target server's address
+    let hub_addr = client.connect_to_hub().await?;
+    client.get_server_from_hub(hostname, hub_addr).await?;
 
-    
+    // 2. Attempt direct connection, falling back to relay if needed
+    let server_addr = client
+        .try_connect_or_relay( tofu_enable, hostname)
+        .await?;
+
+    // 3. Authenticate and store session
+    let authenticate_request = client
+        .authenticate_internal(username, password, Some(hostname))
+        .await
+        .context("Authentication failed")?;
+
+    let session = session {
+        hostname: Some(hostname.to_string()),
+        authenticate_request: authenticate_request.clone(),
+    };
+
+    *client.session.write().await = Some(session);
+
+    VAULT_DRIVE_MAP.insert(
+        (server_addr, authenticate_request.user_id),
+        Arc::clone(&client),
+    );
 
     Ok(server_addr)
-
 }
 
 pub async fn execute_mount(

@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        driveManagerUI::runUI().await.expect("Failed to run drive manager");
+        driveManagerUI::run_ui().await.expect("Failed to run drive manager");
 
 
         info!("Tauri application closed");
