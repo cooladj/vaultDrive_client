@@ -1,27 +1,24 @@
 use anyhow::{Context, Result, bail, anyhow};
 use std::net::SocketAddr;
-use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use aes_gcm::{Aes256Gcm, KeyInit};
 use bytes::Bytes;
-use dashmap::{DashMap, DashSet};
-use ed25519_dalek::SigningKey;
+use dashmap::{DashMap};
+
 use log::info;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use rand_core::{OsRng, RngCore};
 use tokio::join;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::debug;
 use winfsp::host::FileSystemHost;
-use orion::aead;
 use quinn::Connection;
 use crate::auth::{authenticate, reauthenticate, session};
 use crate::autoRun::{connection, remove_connection};
-use crate::driveManagerUI::{ConnectionType, ScopeType};
+use crate::commands::connection_hub;
+use crate::driveManagerUI::{ConnectionType};
 use crate::filesystem::winfsp::{VirtualFileSystem};
 use crate::network::{QuicClient, read_message, write_message, ZERO_ADDR};
 use crate::proto::hub;
@@ -42,8 +39,8 @@ pub struct VaultDriveClient {
     pub server_addr: RwLock<SocketAddr>,
     pub secondary_server_addr: RwLock<Option<SocketAddr>>,
 
-    ///local mount point , (mount thread handle, host mount point, Scope)
-    pub mounts: DashMap<String, (MOUNT_TYPES, String, Arc<parking_lot::RwLock<String>>)>,
+    ///local mount point , (mount thread handle, host mount point, Scope, Compression)
+    pub mounts: DashMap<String, (MOUNT_TYPES, String, Arc<parking_lot::RwLock<String>>, Arc<AtomicBool>)>,
     pub scope: String,
 
 }
@@ -58,10 +55,8 @@ impl VaultDriveClient {
         if let Some(existing) = VAULT_DRIVE_MAP.get(&(server_addr, username)) {
             return Ok(existing.clone());
         }
-        tracing::debug!("Creating new Vault drive client");
 
         let quic = QuicClient::new().await?;
-        tracing::debug!("Created new quic client");
         let client = Arc::new(Self {
             quic,
             session: Arc::new(RwLock::new(None)),
@@ -83,71 +78,58 @@ impl VaultDriveClient {
             .clone();
 
         let user_id = session.authenticate_request.user_id.clone();
+        let old_addr = *self.server_addr.read().await;
+        let old_connection = self.quic.connection.remove(&old_addr);
 
-        // If we have a hostname, resolve new server addr from hub
-        if let Some(hostname) = &session.hostname {
-            let old_addr = *self.server_addr.read().await;
-            self.connect_to_hub().await?;
-            ///todo fix this need toget server id
-            debug!("Got server addr from hub");
+        let result = {
+            let inner = async {
+                if let Some(hostname) = &session.hostname {
+                    debug!("Renew using hostname: {}", hostname);
+                    let hub_addr = self.connect_to_hub().await?;
+                    self.get_server_from_hub(hostname, hub_addr).await?;
 
-            let new_addr = *self.server_addr.read().await;
-            if old_addr != new_addr {
-                VAULT_DRIVE_MAP.insert((new_addr, user_id.clone()), self.clone());
-                VAULT_DRIVE_MAP.remove(&(old_addr, user_id.clone()));
-                self.quic.connection.remove(&old_addr);
-                debug!("Performing renew connection clean up");
-            }
-        }
+                    let new_addr = self
+                        .try_connect_or_relay(true, hostname)
+                        .await?;
 
-        let mut server_addr = *self.server_addr.read().await;
-        debug!("Removing old connection");
-        let old_connection = self.quic.connection.remove(&server_addr);
-
-        debug!("About to call connect for {}", server_addr);
-
-        if self.quic.connect(&server_addr, Some(true), None, None).await.is_err() {
-            // Primary failed — try secondary
-            let sec_addr = match *self.secondary_server_addr.read().await {
-                Some(addr) => addr,
-                None => {
-                    Self::restore_old_conn(&self.quic, server_addr, old_connection);
-                    bail!("Primary connection failed and no secondary address available");
+                    if old_addr != new_addr {
+                        VAULT_DRIVE_MAP.insert((new_addr, user_id.clone()), self.clone());
+                        VAULT_DRIVE_MAP.remove(&(old_addr, user_id.clone()));
+                        debug!("Performing renew connection clean up");
+                    }
+                    Ok(new_addr)
+                } else {
+                    debug!("Connecting directly to addr: {}", old_addr);
+                    self.connect(&session.authenticate_request.user_id, true).await?;
+                    Ok(old_addr)
                 }
-            };
+            }.await;
 
-            match self.quic.connect(&sec_addr, Some(true), None, None).await {
-                Ok(_) => {
-                    *self.server_addr.write().await = sec_addr;
-                    VAULT_DRIVE_MAP.insert((sec_addr, user_id.clone()), self.clone());
-                    VAULT_DRIVE_MAP.remove(&(server_addr, user_id.clone()));
-                    server_addr = sec_addr;
-                }
-                Err(_) => {
-                    Self::restore_old_conn(&self.quic, server_addr, old_connection);
-                    bail!("Primary connection failed and no secondary address available");
+            match inner {
+                Ok(addr) => addr,
+                Err(e) => {
+                    Self::restore_old_conn(self.quic, old_connection);
+                    return Err(e);
                 }
             }
-        }
+        };
 
-        debug!("Connected to {}", server_addr);
+
 
         let reauth = self.reauthenticate(session.hostname.as_deref(), &session.authenticate_request.user_id).await
             .context("Authentication failed")?;
 
         debug!("Authentication succeeded for {}", reauth.host_name);
 
-        Ok(server_addr)
+        Ok(result)
     }
 
-    /// Restore the old connection if reconnection fails (keeps mount alive for auto-reauth)
     fn restore_old_conn(
         quic: &QuicClient,
-        addr: SocketAddr,
         old_connection: Option<(SocketAddr, Connection)>,
     ) {
         if let Some(old_conn) = old_connection {
-            quic.connection.insert(addr, old_conn.1);
+            quic.connection.insert(old_conn.0, old_conn.1);
         }
     }
 
@@ -207,16 +189,21 @@ impl VaultDriveClient {
         let token = relay_response
             .token
             .context("Hub relay succeeded but returned no token")?;
+        let socket_addr = if let Some(socketaddr) = relay_response.socket_addr{
+            socketaddr.parse().unwrap_or(ZERO_ADDR)
+        }else {
+            ZERO_ADDR
+        };
+
 
         self.quic
-            .connect(&ZERO_ADDR, Some(tofu_enable), Some(token), Some(server_ip))
+            .connect(&socket_addr, Some(tofu_enable), Some(token), Some(server_ip))
             .await
             .context("Failed to connect to remote server via hub relay")?;
 
-        // Update stored addr so future operations use the relay path
-        *self.server_addr.write().await = ZERO_ADDR;
+        *self.server_addr.write().await = server_ip;
 
-        Ok(ZERO_ADDR)
+        Ok(server_ip)
     }
 
 
@@ -318,7 +305,7 @@ impl VaultDriveClient {
     pub(crate) async fn reauthenticate(&self, hostname: Option<&str>, username: &str) -> Result<AuthenticationSuccessResponse>{
         let server_addr = *self.server_addr.read().await;
 
-        tracing::debug!("authenticate_internal: Opening bidirectional stream to {:?}", server_addr);
+        tracing::debug!("reauthenticate: Opening bidirectional stream to {:?}", server_addr);
         let (mut send, mut recv) = self.quic.open_bi_safe(server_addr).await
             .context("Failed to open bidirectional stream")?;
         let (connection_type ,connection_point) = match hostname {
@@ -327,7 +314,7 @@ impl VaultDriveClient {
         };
 
 
-        let result = reauthenticate(&mut send, &mut recv, username, connection_type, connection_point.as_str(), server_addr,self.scope.as_str()).await;
+        let result = reauthenticate(&mut send, &mut recv, username, connection_type, connection_point.as_str(),self.scope.as_str()).await;
         if result.is_err(){
             remove_connection(connection_type,connection_point, username);
 
@@ -361,7 +348,6 @@ impl VaultDriveClient {
         };
         tracing::debug!("authenticate_internal: building connection row");
 
-        let key = aead::SecretKey::default();
         tracing::debug!("authenticate_internal: key generated");
 
         let connection_row = connection{
@@ -370,15 +356,17 @@ impl VaultDriveClient {
             connection_point,
             username: username.to_string(),
             scope: self.scope.clone(),
-            key: key.unprotected_as_bytes().to_vec(),
+            key: Vec::new(),
             mounts: None,
         };
 
-        let result = authenticate(&mut send, &mut recv, username, password, server_addr, connection_row).await;
+        let result = authenticate(&mut send, &mut recv, username, password, connection_row).await;
 
 
         result
     }
+
+
 
 
 
@@ -390,6 +378,8 @@ impl VaultDriveClient {
 
         let server_addr = *server_addr_guard;
         let username = session_guard.as_ref().unwrap().authenticate_request.user_id.clone();
+        drop(session_guard);
+        drop(server_addr_guard);
 
 
 
@@ -409,7 +399,7 @@ impl VaultDriveClient {
     }
 
     
-    pub async fn open_file(&self, path: &str, file_id: u64, flags: u32) -> Result<()> {
+    pub async fn open_file(&self, path: &str, file_id: u64, flags: u32) -> Result<OperationSuccessResponse> {
         let request = Request {
             request_type: Some(request::RequestType::OpenFile(OpenFileRequest {
                 path: path.to_string(),
@@ -419,7 +409,7 @@ impl VaultDriveClient {
         };
         let response = self.execute_request(request).await?;
         match response.response_type {
-            Some(response::ResponseType::OperationSuccess(_)) => Ok(()),
+            Some(response::ResponseType::OperationSuccess(operationSuccess)) => Ok(operationSuccess),
             _ => bail!("Unexpected response type for delete file"),
         }
     }
@@ -454,12 +444,16 @@ impl VaultDriveClient {
         let response = self.execute_request(request).await?;
 
         match response.response_type {
-            Some(response::ResponseType::FileInfo(info)) => Ok(info),
-            _ => bail!("Unexpected response type for get file info"),
+            Some(response::ResponseType::FileInfo(info)) =>{
+                debug!("get_file_info successfully for: {:?}", path);
+                Ok(info)},
+            _ => {
+                debug!("failed to get file info for: {:?}", path);
+                bail!("Unexpected response type for get file info")},
         }
     }
 
-    pub async fn read_file(&self, path: &str, offset: u64, length: u32, file_id: u64) -> Result<Bytes> {
+    pub async fn read_file(&self, path: &str, offset: u64, length: u32, file_id: u64, compress: Arc<AtomicBool>) -> Result<Vec<u8>> {
 
 
         let request = Request {
@@ -468,6 +462,7 @@ impl VaultDriveClient {
                 offset,
                 length,
                 file_id,
+                compress: compress.load(Ordering::Relaxed),
             })),
         };
 
@@ -475,26 +470,30 @@ impl VaultDriveClient {
 
         match response.response_type {
             Some(response::ResponseType::FileData(data)) => {
-                let bytes = Bytes::from(data.data);
-                
-
+                let bytes = if data.compressed {
+                    let decompressed = zstd::decode_all(data.data.as_slice())?;
+                    decompressed
+                } else {
+                    data.data
+                };
                 Ok(bytes)
             }
             _ => bail!("Unexpected response type for read file"),
         }
     }
-    pub async fn create_file(&self, path: &str, flags: u32, file_id: u64) -> Result<()> {
+    pub async fn create_file(&self, path: &str, flags: u32, file_id: u64, include_file_info: Option<bool>) -> Result<OperationSuccessResponse> {
         let request = Request {
             request_type: Some(request::RequestType::CreateFile(CreateFileRequest {
                 path: path.to_string(),
                 file_id ,
                 flags,
+                include_file_info,
             })),
         };
         let response = self.execute_request(request).await?;
 
         match response.response_type {
-            Some(response::ResponseType::OperationSuccess(_)) => Ok(()),
+            Some(response::ResponseType::OperationSuccess(success)) => Ok(success),
             _ => bail!("Unexpected response type for delete file"),
         }
 
@@ -502,39 +501,61 @@ impl VaultDriveClient {
     pub async fn override_file(
         &self,
         file_id: u64,
-    ) -> Result<()>{
+        include_file_info: Option<bool>
+    ) -> Result<OperationSuccessResponse> {
         let request = Request {
             request_type: Some(request::RequestType::OverrideFile(OverrideFileRequest {
-                file_id
+                file_id,
+                include_file_info,
             })),
         };
         let response = self.execute_request(request).await?;
 
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(success)) => {
-                Ok(())
+                Ok(success)
             }
             _ => bail!("Unexpected response type for override file"),
         }
     }
 
 
+
+
+
     pub async fn write_file(
         &self,
         path: &str,
         offset: u64,
-        data: Vec<u8>,
+        data: &[u8],
         file_id: u64,
-        flags: u32
-    ) -> Result<u64> {
+        flags: u32,
+        compress: Arc<AtomicBool>,
+        is_compressed: bool,
+        include_file_info: Option<bool>
+    ) -> Result<WriteSuccessResponse> {
+        let (data, compressed) = if compress.load(Ordering::Relaxed)
+            && !is_compressed
+        {
+            let c = zstd::encode_all(data, 3)?;
+            if c.len() < data.len() {
+                (c, true)
+            } else {
+                (data.to_vec(), false)
+            }
+        } else {
+            (data.to_vec(), false)
+        };
 
         let request = Request {
             request_type: Some(request::RequestType::WriteFile(WriteFileRequest {
                 path: path.to_string(),
                 offset,
                 data,
-                file_id ,
+                file_id,
                 flags,
+                compressed,
+                include_file_info
             })),
         };
 
@@ -542,7 +563,7 @@ impl VaultDriveClient {
 
         match response.response_type {
             Some(response::ResponseType::WriteSuccess(success)) => {
-                Ok(success.bytes_written)
+                Ok(success)
             }
             _ => bail!("Unexpected response type for write file"),
         }
@@ -594,17 +615,20 @@ impl VaultDriveClient {
         }
     }
 
-    pub async fn create_directory(&self, path: &str) -> Result<()> {
+    pub async fn create_directory(&self, path: &str, include_file_info: Option<bool>
+    ) -> Result<OperationSuccessResponse> {
         let request = Request {
             request_type: Some(request::RequestType::CreateDirectory(CreateDirectoryRequest {
                 path: path.to_string(),
+
+                include_file_info,
             })),
         };
 
         let response = self.execute_request(request).await?;
 
         match response.response_type {
-            Some(response::ResponseType::OperationSuccess(_)) => Ok(()),
+            Some(response::ResponseType::OperationSuccess(success)) => Ok(success),
             _ => bail!("Unexpected response type for create directory"),
         }
     }
@@ -638,7 +662,7 @@ impl VaultDriveClient {
     }
 
     pub async fn get_volume_info(&self, volume_id: &str) -> Result<VolumeInfo> {
-        info!("Getting volume info for volume {}", volume_id);
+        debug!("Getting volume info for volume {}", volume_id);
         let request = Request {
             request_type: Some(request::RequestType::GetVolumeInfo(GetVolumeInfoRequest {
                 volume_id: volume_id.to_string(),

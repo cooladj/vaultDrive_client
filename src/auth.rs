@@ -12,7 +12,7 @@ use rand_core::OsRng;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 use x509_parser::nom::AsBytes;
-use crate::autoRun::{connection, get_connection_from_db, insert_connection};
+use crate::autoRun::{connection, get_connection_from_db, insert_connection, update_connect_key};
 use crate::driveManagerUI::ConnectionType;
 
 #[derive(Clone, Default)]
@@ -27,8 +27,7 @@ pub async fn authenticate(
     recv: &mut RecvStream,
     username: &str,
     password: String,
-    socket_addr: SocketAddr,
-    connection: connection
+    mut connection: connection
 ) -> Result<AuthenticationSuccessResponse> {
     tracing::info!("Starting authentication for user: {}", username);
 
@@ -40,7 +39,6 @@ pub async fn authenticate(
                 username: username.to_string(),
                 password: password.to_string(),
                 connection_id: connection.connection_id.to_string(),
-                key: connection.key.clone()
             },
         )),
     };
@@ -54,27 +52,12 @@ pub async fn authenticate(
 
         Some(response::ResponseType::AuthenticationSuccess(success)) => {
             tracing::info!("Authentication successful for user: {}", username);
+            connection.key = success.key.clone();
+
+
                 insert_connection(connection).await;
 
-            match success.port {
-                None => {}
-                Some(port) => {
-                    let child_connect = SocketAddr::new(socket_addr.ip(), port as u16);
-                    let quic = QuicClient::new().await?;
-                    let server_name= ServerName::try_from("vaultDriveServer")
-                        .context("Invalid server name")?;
-
-                    let conn = quic.endpoint
-                        .connect(child_connect, &server_name.to_str())?
-                        .await
-                        .context("Failed to establish QUIC connection")?;
-
-                    quic.connection.insert(socket_addr, conn);
-
-                }
-            }
-            
-            Ok(success)
+            Ok(success.authentication_success.context("Missing authentication_success field")?)
         }
         Some(response::ResponseType::Error(err)) => {
 
@@ -91,7 +74,6 @@ pub async fn reauthenticate(
     username: &str,
     connection_type: ConnectionType,
     connection_point: &str,
-    socket_addr:SocketAddr,
     scope: &str
 ) -> Result<AuthenticationSuccessResponse> {
     let connection = get_connection_from_db(connection_type, connection_point, username, scope)
@@ -113,27 +95,13 @@ pub async fn reauthenticate(
 
     match auth_response.response_type {
 
+
         Some(response::ResponseType::AuthenticationSuccess(success)) => {
             tracing::info!("Authentication successful for user: {}", username);
 
-            if let (Some(port), Some(cert)) = (success.port.clone(), success.cert.clone()) {
+            update_connect_key(&connection.connection_id, &success.key).await?;
 
-                let child_connect = SocketAddr::new(socket_addr.ip(), port as u16);
-                let quic = QuicClient::new().await?;
-                let server_name= ServerName::try_from("vaultDriveServer")
-                    .context("Invalid server name")?;
-
-
-
-                let conn = quic.endpoint
-                    .connect_with(pin_cert_client_config(cert)?, child_connect, &server_name.to_str())?
-                    .await
-                    .context("Failed to establish QUIC connection")?;
-
-                quic.connection.insert(socket_addr, conn);
-            }
-
-            Ok(success)
+            Ok(success.authentication_success.context("Missing authentication_success field")?)
         }
         Some(response::ResponseType::Error(err)) => {
 

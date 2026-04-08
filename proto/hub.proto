@@ -124,6 +124,7 @@ message ClientRelayRequest {
 }
 message ClientRelayResponse{
   optional bytes token = 1;
+  optional string socket_addr =2;
 }
 
 

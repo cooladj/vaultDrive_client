@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing::debug;
 use crate::client::VaultDriveClient;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::collections::VecDeque;
 use parking_lot::RwLock;
@@ -18,11 +18,13 @@ pub async fn mount(
     mount_point: &str,
     drive: &str,
     scope: String,
+    compress: bool
 ) -> Result<()> {
     let scope = Arc::new(RwLock::new(scope));
+    let compress = Arc::new(AtomicBool::new(compress));
     #[cfg(target_os = "windows")]
     {
-        let mount = winfsp::mount(client.clone(), &mut mount_point.to_string(), drive, scope).await?;
+        let mount = winfsp::mount(client.clone(), &mut mount_point.to_string(), drive, scope, compress).await?;
     }
 
     #[cfg(unix)]
@@ -51,7 +53,7 @@ pub async fn mount_to_UI_tuple(client: Arc<VaultDriveClient> ) -> Result<Vec<(Ar
         let results: Vec<(Arc<str>, Arc<str>)> = client.mounts
             .iter()
             .map(|entry| {
-                let (k, (_, label, _)) = entry.pair();
+                let (k, (_, label, _, _)) = entry.pair();
                 (Arc::<str>::from(k.as_str()), Arc::<str>::from(label.as_str()))
             })
             .collect();
@@ -60,6 +62,7 @@ pub async fn mount_to_UI_tuple(client: Arc<VaultDriveClient> ) -> Result<Vec<(Ar
     
 
 }
+
 
 pub const READ: u32 = 1 << 0;
 pub const WRITE: u32 = 1 << 1;
@@ -75,6 +78,9 @@ pub const DELETE: u32 = 1 << 10;
 pub const DELETE_CHILDREN: u32 = 1 << 11;
 pub const TRANSVERSE: u32 = 1 << 12;
 
+pub const WINDOW_SHARE_READ: u32 = 1 << 13;
+pub const WINDOW_SHARE_WRITE: u32 = 1 << 14;
+pub const WINDOW_SHARE_DELETE: u32 = 1 << 15;
 
 
 

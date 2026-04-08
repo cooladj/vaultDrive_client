@@ -2,6 +2,7 @@
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::scope;
@@ -186,7 +187,6 @@ pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
                             let socket_addr: SocketAddr = connection.connection_point.parse()?;
                             let client =
                                 VaultDriveClient::new(socket_addr, connection.username.clone(), connection.scope).await?;
-                            client.try_connect_or_relay(false, &connection.connection_point).await?;
                             (client, None)
                         }
                         ConnectionType::Hub => {
@@ -195,7 +195,8 @@ pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
 
                             let hub_addr = client.connect_to_hub().await?;
                             client.get_server_from_hub(&connection.connection_point, hub_addr).await?;
-                            client.try_connect_or_relay(false, &connection.connection_point).await?;
+                            *client.server_addr.write().await = client.try_connect_or_relay(false, &connection.connection_point).await?;
+
                             (client, Some(connection.connection_point))
                         }
                     };
@@ -212,6 +213,8 @@ pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
                                 mount.host_drive.as_str(),
                                 mount.mount_point.as_str(),
                                 mount.scope,
+                                mount.compress
+                                
                             )
                                 .await
                             {
@@ -276,16 +279,16 @@ pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
         });
     }
 }
-const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
+pub const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
 #[cfg(unix)]
 const DAEMON_PRIV_KEY_PATH: &str = "/etc/vaultdrive/daemon.key";
 #[cfg(unix)]
-const DAEMON_PUB_KEY_PATH: &str = "/etc/vaultdrive/daemon.pub";
+pub const DAEMON_PUB_KEY_PATH: &str = "/etc/vaultdrive/daemon.pub";
 
 #[cfg(windows)]
 const DAEMON_PRIV_KEY_PATH: &str = r"C:\ProgramData\VaultDrive\daemon.key";
 #[cfg(windows)]
-const DAEMON_PUB_KEY_PATH: &str = r"C:\ProgramData\VaultDrive\daemon.pub";
+pub const DAEMON_PUB_KEY_PATH: &str = r"C:\ProgramData\VaultDrive\daemon.pub";
 
 pub fn generate_and_save_keypair() -> anyhow::Result<()> {
     if std::path::Path::new(DAEMON_PUB_KEY_PATH).exists()

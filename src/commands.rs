@@ -1,32 +1,31 @@
 use anyhow::{anyhow, Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::fs;
+use std::sync::atomic::Ordering;
+use std::thread::scope;
 use tracing;
 use std::time::Duration;
 use bytes::Bytes;
-use egui::TextBuffer;
 use futures::{SinkExt, StreamExt};
 use futures::future::join_all;
 use interprocess::local_socket;
 use interprocess::local_socket::{GenericFilePath, ToFsName};
 use interprocess::local_socket::traits::tokio::Stream;
 use log::debug;
-use rustls::ClientConfig;
-use rustls::pki_types::ServerName;
+
 use tokio::join;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use serde::{Deserialize, Serialize};
-use tokio_rustls::TlsConnector;
-use winreg::types::ToRegValue;
+
 use crate::auth::session;
-use crate::autoRun::{connection, get_scope, insert_mount, mounts, remove_connection, remove_mount, update_scope};
+use crate::autoRun::{ get_scope_and_compress, insert_mount, mounts, remove_connection, remove_mount, update_scope_and_compress};
 use crate::client::{VAULT_DRIVE_MAP, VaultDriveClient};
+use crate::deamonize::{DAEMON_PUB_KEY_PATH, NOISE_PATTERN};
 use crate::driveManagerUI::{Connection, ConnectionType, Drive, ScopeType};
 use crate::filesystem::{mount_to_UI_tuple};
-use crate::network::{AcceptAllVerifier, ZERO_ADDR};
+use crate::network::{ ZERO_ADDR};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum SocketCommand {
@@ -51,20 +50,13 @@ pub enum SocketCommand {
         socketaddr: SocketAddr,
         username: String,
         scope: String,
+        compress: bool,
 
     },
     Volumes {
         user_id: String,
         connection: Option<Connection>,
         elevated : bool,
-    },
-    Scope{
-        scope: String,
-        username:String,
-        socketaddr: SocketAddr,
-        mount_point: String,
-        
-        
     },
     Health,
 
@@ -99,7 +91,7 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
 
                   connection_direct(sockerAdder, username.as_str(), password, scope_type, tofu_enable).await
             }else {
-              connection_hub( &*connection_point, username.as_str(),password, scope_type, tofu_enable).await
+              connection_hub( &connection_point, username.as_str(),password, scope_type, tofu_enable).await
           };
           match operation {
               Ok(socket_addr) => CommandResponse::Success(ResponseData::Text(socket_addr.to_string())),
@@ -107,8 +99,8 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
           }
         }
 
-        SocketCommand::Mount {mount_point, socketaddr, username, drive,  scope} => {
-            match execute_mount(&mount_point, socketaddr,  &username,  &drive, scope).await {
+        SocketCommand::Mount {mount_point, socketaddr, username, drive,  scope, compress} => {
+            match execute_mount(&mount_point, socketaddr,  &username,  &drive, scope, compress).await {
                 Ok(_) => CommandResponse::Success(ResponseData::Empty),
                 Err(e) => CommandResponse::Error(e.to_string()),
             }
@@ -135,12 +127,7 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
             }
 
         }
-        SocketCommand::Scope {scope, username, mount_point, socketaddr} => {
-            match execute_scope_change(mount_point, socketaddr, username, scope).await {
-                Ok(_) => CommandResponse::Success(ResponseData::Empty),
-                Err(e) => CommandResponse::Error(e.to_string()),
-            }
-        }
+
         SocketCommand::Disconnect {username, socketaddr} => {
 
             match execute_disconnect(username, socketaddr).await {
@@ -156,12 +143,9 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
         _ => CommandResponse::Error("Invalid command".to_string()),
     }
 }
-const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
-#[cfg(unix)]
-const DAEMON_PUB_KEY_PATH: &str = "/etc/vaultdrive/daemon.pub";
+
 
 #[cfg(windows)]
-const DAEMON_PUB_KEY_PATH: &str = r"C:\ProgramData\VaultDrive\daemon.pub";
 const TIMEOUT_SECS: u64 = 5;
 
 pub async fn send_command_to_daemon(command: SocketCommand) -> Result<CommandResponse> {
@@ -208,7 +192,6 @@ pub async fn send_command_to_daemon(command: SocketCommand) -> Result<CommandRes
 
     let mut noise = initiator.into_transport_mode()?;
 
-    // --- Send encrypted command ---
     let command_bytes = postcard::to_allocvec(&command)?;
     let len = noise.write_message(&command_bytes, &mut buf)?;
     timeout(
@@ -216,7 +199,6 @@ pub async fn send_command_to_daemon(command: SocketCommand) -> Result<CommandRes
         framed.send(Bytes::copy_from_slice(&buf[..len]))
     ).await.map_err(|_| anyhow!("Write timed out"))??;
 
-    // --- Read encrypted response ---
     let encrypted = timeout(
         Duration::from_secs(TIMEOUT_SECS),
         framed.next()
@@ -240,7 +222,7 @@ pub async fn execute_unmount(mount_point: String, server: SocketAddr, username:S
     let host = client.mounts
         .remove(&mount_point);
 
-    if let Some((_, (_, host_drive, _))) = host {
+    if let Some((_, (_, host_drive, _ ,_))) = host {
         let (connection_type, connection_point) = client.session.read().await
             .as_ref()
             .and_then(|session| session.hostname.as_ref())
@@ -255,41 +237,7 @@ pub async fn execute_unmount(mount_point: String, server: SocketAddr, username:S
     Ok(())
 }
 
-pub async fn execute_scope_change(
-    mount_point: String,
-    server: SocketAddr,
-    username: String,
-    scope_type: String,
-) -> Result<()> {
-    let client = VAULT_DRIVE_MAP
-        .get(&(server, username.to_string()))
-        .map(|entry| entry.clone())
-        .ok_or_else(|| anyhow!("Client not found"))?;
 
-    let (connection_type, connection_point) = client.session.read().await
-        .as_ref()
-        .and_then(|session| session.hostname.as_ref())
-        .map(|hostname| (ConnectionType::Hub, hostname.clone()))
-        .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
-
-    if let Some(mount) = client.mounts.get(&mount_point) {
-        *mount.value().2.write() = scope_type.clone();
-        let drive = mount.value().1.clone();
-        
-        drop(mount);
-        update_scope(
-            connection_type,
-            connection_point,
-            username,
-            mount_point,
-            drive,
-            scope_type,
-        )
-            .await?;
-    }
-
-    Ok(())
-}
 
 pub async fn execute_disconnect(username: String, server: SocketAddr) -> Result<()>{
     debug!("Disconnecting from vaultDrive: {:?} and username: {:?}", server, username);
@@ -350,7 +298,6 @@ pub async fn execute_get_ui_connections(user_id: String, elevated: bool) -> Resu
             let volumes = volumes_result.unwrap_or_default();
             let mountUITuple = mount_result.unwrap_or_default();
             let session = session_guard.clone().unwrap();
-            let server_addr = server_addr_guard.clone();
 
             debug!("This is the mountUiTuple {:?}", mountUITuple.clone());
             drop(session_guard);
@@ -359,8 +306,6 @@ pub async fn execute_get_ui_connections(user_id: String, elevated: bool) -> Resu
 
             let username = session.authenticate_request.user_id.clone();
 
-            // Prepare all exists checks and volume data separately
-            let mut exists_futures = Vec::new();
             let mut volume_data = Vec::new();
 
             for volume in volumes {
@@ -371,29 +316,26 @@ pub async fn execute_get_ui_connections(user_id: String, elevated: bool) -> Resu
                     Some((p, l)) => (Some(p.as_ref().to_string()), Some(l.as_ref().to_string())),
                     None => (None, None),
                 };
-
-                let (connection_type, connection_point) = if let Some(hostname) = session.hostname.clone() {
-                    (ConnectionType::Hub, hostname.clone())
+                let (scope, compress) = if let Some(path) = path.clone() {
+                    if let Some(entry) = client.mounts.get(&path) {
+                        let (_, _, scope_rwlock, atomic_compress) = entry.value();
+                        let scope_val = scope_rwlock.read().clone();
+                        let compress_val = atomic_compress.load(Ordering::Relaxed);
+                        (scope_val, compress_val)
+                    } else {
+                        (Default::default(), false)
+                    }
                 } else {
-                    (ConnectionType::Direct, server_addr.to_string())
+                    (Default::default(), false)
                 };
 
-                let username_clone = username.clone();
-                let host_drive = volume.root_path.clone();
-
-                exists_futures.push(get_scope(connection_type, connection_point, username_clone.clone(), host_drive));
-                // Store the volume data
-                volume_data.push((volume, path, label));
+                volume_data.push((volume, path, label, scope, compress ));
             }
 
-            // Await all exists checks concurrently
-            let exists_results = join_all(exists_futures).await;
 
-            // Build drives from results
             let drives: Vec<Drive> = volume_data.into_iter()
-                .zip(exists_results.into_iter())
-                .map(|((volume, path, label), exists_result)| {
-                    let exist = exists_result.unwrap_or_default();
+                .map(|((volume, path, label, scope, compress))| {
+
 
                     Drive::new(
                         &volume.name,
@@ -403,7 +345,8 @@ pub async fn execute_get_ui_connections(user_id: String, elevated: bool) -> Resu
                         label.is_some(),
                         volume.available_space / 1073741824,
                         volume.total_size / 1073741824,
-                        exist,
+                        scope,
+                        compress,
                     )
                 })
                 .collect();
@@ -509,22 +452,44 @@ pub async fn execute_mount(
     username: &str,
     drive: &str,
     scope: String,
+    compress: bool
 ) -> Result<()> {
     let client = VAULT_DRIVE_MAP
         .get(&(server, username.to_string()))
         .map(|entry| entry.clone())
         .ok_or_else(|| anyhow!("Client not found"))?;
-
+    debug!("Executing mount {:?}", mount_point);
+    debug!("mounts: {:?}", client.mounts.iter().map(|entry| entry.key().clone()).collect::<Vec<_>>());
     let (connection_type, connection_point) = client.session.read().await
         .as_ref()
         .and_then(|session| session.hostname.as_ref())
         .map(|hostname| (ConnectionType::Hub, hostname.clone()))
         .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
+    if let Some(entry) = client.mounts.get(mount_point) {
+        let (_, _, rwlock_scope, atomic_compress) = entry.value();
+
+        *rwlock_scope.write() = scope.clone();
+        atomic_compress.store(compress, Ordering::Relaxed);
+        update_scope_and_compress(
+            connection_type,
+            &connection_point,
+            username,
+            &mount_point,
+            &drive,
+            &scope,
+            compress
+        )
+            .await?;
+
+        return Ok(());
+    }
+
+
 
     debug!("Executing mount {:?}", mount_point);
 
-    let _mount = crate::filesystem::mount(client, mount_point, drive, scope).await?;
-    insert_mount(connection_type,&connection_point,&username,&mount_point,&drive).await?;
+    let _mount = crate::filesystem::mount(client, mount_point, drive, scope.clone(), compress).await?;
+    insert_mount(connection_type, &connection_point, &username, &mount_point, &drive, &compress, &scope).await?;
 
     Ok(())
 }

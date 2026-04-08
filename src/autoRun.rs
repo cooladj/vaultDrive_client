@@ -1,7 +1,7 @@
-﻿use sqlx::SqliteConnection;
+﻿use sqlx::{Row, SqliteConnection};
 use sqlx::Connection;
 use rusqlite;
-
+use x509_parser::asn1_rs::Boolean;
 use x509_parser::nom::complete::bool;
 use crate::driveManagerUI::ConnectionType;
 
@@ -20,6 +20,7 @@ pub struct mounts {
     pub mount_point: String,
     pub scope: String,
     pub connection: Option<connection>,
+    pub compress: bool
 }
 
 async fn get_connection() -> anyhow::Result<SqliteConnection> {
@@ -32,11 +33,12 @@ fn get_connection_sync() -> anyhow::Result<rusqlite::Connection> {
 
 pub async fn insert_connection(connection: connection) -> anyhow::Result<()> {
     let mut conn = get_connection().await?;
-    sqlx::query("INSERT INTO connection VALUES (?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO connection (id, connection_type, connection_point, username, scope, key) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(&connection.connection_id)
         .bind(connection.connection_type.to_i32())
         .bind(&connection.connection_point)
         .bind(&connection.username)
+        .bind(&connection.scope)
         .bind(&connection.key)
         .execute(&mut conn)
         .await?;
@@ -49,20 +51,24 @@ pub async fn insert_mount(
     username: &str,
     mount_point: &str,
     host_drive: &str,
+    compress: &bool,
+    scope: &str,
 ) -> anyhow::Result<()> {
     let mut conn = get_connection().await?;
     sqlx::query(
-        "INSERT INTO mounts (host_drive, local_drive, connection_id)
+        "INSERT INTO mounts (host_drive, local_drive, connection_id, compress, scope)
          VALUES (?, ?, (
              SELECT id FROM connection
              WHERE connection_type = ? AND connection_point = ? AND username = ?
-         ))",
+         ), ?, ?)",
     )
         .bind(host_drive)
         .bind(mount_point)
         .bind(connection_type.to_i32())
         .bind(connection_point)
         .bind(username)
+        .bind(compress)
+        .bind(scope)
         .execute(&mut conn)
         .await?;
     Ok(())
@@ -87,6 +93,15 @@ pub async fn remove_mount(
         .bind(connection_type.to_i32())
         .bind(connection_point)
         .bind(username)
+        .execute(&mut conn)
+        .await?;
+    Ok(())
+}
+pub async fn update_connect_key(id: &str, key: &[u8]) -> anyhow::Result<()> {
+    let mut conn = get_connection().await?;
+    sqlx::query("UPDATE connection SET key = ? WHERE id = ?")
+        .bind(key)
+        .bind(id)
         .execute(&mut conn)
         .await?;
     Ok(())
@@ -159,29 +174,32 @@ pub async fn remove_connection(
     Ok(Some(connection_id))
 }
 
-pub async fn update_scope(
+pub async fn update_scope_and_compress(
     connection_type: ConnectionType,
-    connection_point: String,
-    username: String,
-    drive: String,
-    hostdrive: String,
-    scope: String,
+    connection_point: &str,
+    username: &str,
+    drive: &str,
+    hostdrive: &str,
+    scope: &str,
+    compress: bool,
 ) -> anyhow::Result<()> {
     let mut conn = get_connection().await?;
 
     sqlx::query(
         "UPDATE mounts
          SET scope = ?1
-         WHERE local_drive = ?2
-           AND host_drive = ?3
+         SET compress = ?2
+         WHERE local_drive = ?3
+           AND host_drive = ?4
            AND connection_id = (
                SELECT id FROM connection
-               WHERE connection_type = ?4
-                 AND connection_point = ?5
-                 AND username = ?6
+               WHERE connection_type = ?5
+                 AND connection_point = ?6
+                 AND username = ?7
            )",
     )
         .bind(&scope)
+        .bind(compress)
         .bind(&drive)
         .bind(&hostdrive)
         .bind(connection_type as i32)
@@ -223,6 +241,7 @@ pub async fn get_connections_with_mounts() -> anyhow::Result<Vec<connection>> {
             host_drive: row.get("host_drive"),
             mount_point: row.get("local_drive"),
             scope: row.get("mount_scope"),
+            compress: row.get("compress"),
             connection: None,
         };
 
@@ -247,17 +266,17 @@ pub async fn get_connections_with_mounts() -> anyhow::Result<Vec<connection>> {
     Ok(connections)
 }
 
-pub async fn get_scope(
+pub async fn get_scope_and_compress(
     connection_type: ConnectionType,
     connection_point: String,
     username: String,
     host_drive: String,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, bool)> {
     let mut conn = get_connection().await?;
 
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT mounts.scope FROM connection
+        "SELECT mounts.scope AND mounts.compress FROM connection
          JOIN mounts ON mounts.connection_id = connection.id
          WHERE connection.connection_type = ?
            AND connection.connection_point = ?
@@ -271,7 +290,7 @@ pub async fn get_scope(
         .fetch_one(&mut conn)
         .await?;
 
-    Ok(row.get("scope"))
+    Ok((row.get("scope"), row.get("compress")))
 }
 
 
@@ -304,6 +323,7 @@ pub async fn init_db() -> anyhow::Result<()> {
             connection_type INTEGER NOT NULL CHECK(connection_type IN (0, 1)),
             connection_point TEXT NOT NULL,
             username TEXT NOT NULL,
+            scope text,
             key BLOB NOT NULL,
             UNIQUE(connection_type, connection_point, username)
         )",
@@ -316,7 +336,8 @@ pub async fn init_db() -> anyhow::Result<()> {
             host_drive TEXT NOT NULL,
             local_drive TEXT NOT NULL UNIQUE,
             connection_id TEXT NOT NULL,
-            scope TEXT,
+            scope TEXT ,
+            compress BOOLEAN NOT NULL,
             UNIQUE(host_drive, connection_id),
             FOREIGN KEY (connection_id) REFERENCES connection(id)
         )",

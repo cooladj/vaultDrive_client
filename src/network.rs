@@ -53,53 +53,37 @@ static QUIC_CLIENT: OnceCell<QuicClient> = OnceCell::const_new();
 impl QuicClient {
 
     pub async fn new() -> Result<&'static Self> {
-        tracing::debug!("QuicClient::new called, initialized: {}", QUIC_CLIENT.initialized());
         let result = QUIC_CLIENT
             .get_or_try_init(|| async {
-                tracing::debug!("QuicClient starting initialize");
                 let r = Self::initialize().await;
-                tracing::debug!("QuicClient initialize complete: {}", r.is_ok());
                 r
             })
             .await;
-        tracing::debug!("QuicClient::new returning");
         result
     }
     async fn initialize() -> Result<Self> {
-        tracing::debug!("initialize: creating endpoint");
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)
             .context("Failed to create QUIC endpoint")?;
-        tracing::debug!("initialize: endpoint created");
 
         let mut root_store = RootCertStore::empty();
-        tracing::debug!("root_store: created empty");
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let roots: Vec<_> = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
-        tracing::debug!("root_store: collected {} roots", roots.len());
-
-        root_store.extend(roots);
-
-        tracing::debug!("building root_store");
 
         let mut crypto = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
         crypto.alpn_protocols = vec![b"vaultdrive".to_vec()];
-        tracing::debug!("initialize: crypto config built");
 
         let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?
         ));
-        tracing::debug!("initialize: client config created");
 
         let mut transport = TransportConfig::default();
         transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
         client_config.transport_config(Arc::new(transport));
-        tracing::debug!("initialize: transport config set");
 
         endpoint.set_default_client_config(client_config);
-        tracing::debug!("initialize: complete, returning Self");
 
         Ok(Self {
             endpoint,

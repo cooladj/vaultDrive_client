@@ -177,6 +177,8 @@ pub struct ClientRelayRequest {
 pub struct ClientRelayResponse {
     #[prost(bytes = "vec", optional, tag = "1")]
     pub token: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(string, optional, tag = "2")]
+    pub socket_addr: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NotifyRequest {

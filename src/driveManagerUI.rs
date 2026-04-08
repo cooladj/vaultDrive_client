@@ -1,5 +1,5 @@
 ﻿use std::collections::HashMap;
-use crate::commands::{execute_get_ui_connections, send_command_to_daemon, CommandResponse, ResponseData, SocketCommand};
+use crate::commands::{send_command_to_daemon, CommandResponse, ResponseData, SocketCommand};
 use eframe::egui;
 use egui_async::{EguiAsyncPlugin, Bind};
 use egui::{Color32, ComboBox, CornerRadius, Margin, RichText, Sense, Stroke, TextEdit, Vec2, Window};
@@ -15,43 +15,43 @@ use crate::shared::{elevated, get_user_id};
 struct Theme;
 
 impl Theme {
-    // Backgrounds
+    /// Backgrounds
     const BG_PRIMARY: Color32 = Color32::from_rgb(248, 249, 251);
     const BG_CARD: Color32 = Color32::from_rgb(255, 255, 255);
     const BG_CARD_MOUNTED: Color32 = Color32::from_rgb(247, 252, 249);
     const BG_INPUT: Color32 = Color32::from_rgb(243, 244, 246);
     const BG_INPUT_ACTIVE: Color32 = Color32::WHITE;
 
-    // Text
+    /// Text
     const TEXT_PRIMARY: Color32 = Color32::from_rgb(17, 24, 39);
     const TEXT_SECONDARY: Color32 = Color32::from_rgb(107, 114, 128);
     const TEXT_MUTED: Color32 = Color32::from_rgb(156, 163, 175);
     const TEXT_WHITE: Color32 = Color32::WHITE;
 
-    // Accent / Buttons
+    /// Accent / Buttons
     const ACCENT: Color32 = Color32::from_rgb(24, 24, 27);
     const ACCENT_LIGHT: Color32 = Color32::from_rgb(63, 63, 70);
     const ACCENT_SUBTLE: Color32 = Color32::from_rgb(244, 244, 245);
 
-    // Status
+    /// Status
     const SUCCESS: Color32 = Color32::from_rgb(22, 163, 74);
     const SUCCESS_LIGHT: Color32 = Color32::from_rgb(220, 252, 231);
     const DANGER: Color32 = Color32::from_rgb(220, 38, 38);
     const DANGER_LIGHT: Color32 = Color32::from_rgb(254, 226, 226);
     const WARNING: Color32 = Color32::from_rgb(234, 179, 8);
 
-    // Borders
+    /// Borders
     const BORDER: Color32 = Color32::from_rgb(229, 231, 235);
     const BORDER_LIGHT: Color32 = Color32::from_rgb(243, 244, 246);
 
-    // Spacing
+    /// Spacing
     const SP_XS: f32 = 4.0;
     const SP_SM: f32 = 8.0;
     const SP_MD: f32 = 16.0;
     const SP_LG: f32 = 24.0;
     const SP_XL: f32 = 32.0;
 
-    // Sizing
+    /// Sizing
     const CARD_MIN_H: f32 = 260.0;
     const BTN_H: f32 = 36.0;
     const BTN_H_SM: f32 = 32.0;
@@ -63,7 +63,6 @@ impl Theme {
     const BAR_H: f32 = 6.0;
 }
 
-// ── Data types ───────────────────────────────────────────────────────────────
 
 pub async fn run_ui() -> eframe::Result<()> {
     let connections = match send_command_to_daemon(
@@ -123,14 +122,13 @@ pub struct Drive {
     used_space_gb: u64,
     total_space_gb: u64,
     scope: String,
-    editable_mount: String,
-    editable_sync: String,
+    compress: bool,
 }
 
 impl Drive {
     pub fn new(
         name: &str, server_mount_point: &str, mount_path: &str, sync_path: &str,
-        mounted: bool, used_gb: u64, total_gb: u64, scope: String,
+        mounted: bool, used_gb: u64, total_gb: u64, scope: String, compress: bool
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -140,8 +138,7 @@ impl Drive {
             mounted,
             used_space_gb: used_gb,
             total_space_gb: total_gb,
-            editable_mount: String::default(),
-            editable_sync: String::default(),
+            compress,
             scope,
         }
     }
@@ -185,28 +182,6 @@ impl DriveManagerApp {
     }
 }
 
-// Testing default
-impl Default for DriveManagerApp {
-    fn default() -> Self {
-        Self {
-            connections: vec![
-                Connection {
-                    ip_addr: "192.168.1.100:8080".parse().unwrap(),
-                    username: "Jimmy".to_string(),
-                    host_name: "JimmyDesktop".to_string(),
-                    drive: vec![
-                        Drive::new("System Drive", "", "C:\\", "", true, 320, 500, "".to_string()),
-                        Drive::new("Data Drive", "", "D:\\", "", true, 450, 1000, "".to_string()),
-                        Drive::new("External Backup", "", "E:\\", "", false, 1200, 2000, "".to_string()),
-                    ],
-                }
-            ],
-            drive_bind: HashMap::default(),
-            connect_bind: Bind::new(false),
-            dialog: Default::default(),
-        }
-    }
-}
 
 // ── Main update loop ─────────────────────────────────────────────────────────
 
@@ -214,7 +189,7 @@ impl eframe::App for DriveManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.plugin_or_default::<EguiAsyncPlugin>();
 
-        let panel_frame = egui::Frame::none()
+        let panel_frame = egui::Frame::NONE
             .fill(Theme::BG_PRIMARY)
             .inner_margin(0.0);
 
@@ -239,7 +214,7 @@ impl eframe::App for DriveManagerApp {
                 ui.add_space(Theme::SP_LG);
 
                 // ── Connections ───────────────────────────────────────────
-                for (connection_index, connection) in self.connections.clone().iter_mut().enumerate() {
+                for (connection_index, connection) in self.connections.clone().iter().enumerate() {
                     self.render_connection_header(ui, connection, connection_index);
 
                     ui.add_space(Theme::SP_MD);
@@ -352,7 +327,7 @@ impl DriveManagerApp {
         });
     }
 
-    fn render_connection_header(&mut self, ui: &mut egui::Ui, connection: &mut Connection, _index: usize) {
+    fn render_connection_header(&mut self, ui: &mut egui::Ui, connection: &Connection, _index: usize) {
         ui.horizontal(|ui| {
             ui.add_space(Theme::PAGE_PAD);
 
@@ -433,7 +408,7 @@ impl DriveManagerApp {
 
         let drive_clone = drive.clone();
 
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(card_color)
             .stroke(Stroke::new(1.0, Theme::BORDER))
             .corner_radius(Theme::RADIUS_LG)
@@ -467,7 +442,7 @@ impl DriveManagerApp {
                                 ("Unmounted", Theme::ACCENT_SUBTLE, Theme::TEXT_SECONDARY)
                             };
 
-                            egui::Frame::none()
+                            egui::Frame::NONE
                                 .fill(badge_bg)
                                 .corner_radius(Theme::RADIUS_SM)
                                 .inner_margin(Margin::symmetric(10, 3))
@@ -513,7 +488,7 @@ impl DriveManagerApp {
                             .inner_margin(Theme::SP_SM)
                             .show(ui, |ui| {
                                 ui.add(
-                                    TextEdit::singleline(&mut drive.editable_mount)
+                                    TextEdit::singleline(&mut drive.mount_path)
                                         .font(egui::FontId::proportional(13.0))
                                         .frame(false)
                                         .text_color(Theme::TEXT_PRIMARY)
@@ -589,70 +564,129 @@ impl DriveManagerApp {
                     ui.add_space(Theme::SP_LG);
 
                     // ── Action buttons ───────────────────────────────
-                    ui.horizontal(|ui| {
-                        // Mount / Unmount button
-                        let (button_text, button_fill, text_color, btn_stroke) = if drive.mounted {
-                            ("Unmount", Theme::ACCENT_SUBTLE, Theme::TEXT_PRIMARY, Stroke::new(1.0, Theme::BORDER))
-                        } else {
-                            ("Mount", Theme::ACCENT, Theme::TEXT_WHITE, Stroke::NONE)
-                        };
-
-                        let button_response = ui.add_enabled(
-                            !mount_loading,
-                            egui::Button::new(
-                                RichText::new(button_text)
-                                    .size(12.0)
-                                    .color(text_color),
-                            )
-                                .fill(button_fill)
-                                .stroke(btn_stroke)
-                                .corner_radius(Theme::RADIUS_SM)
-                                .min_size(Vec2::new(80.0, Theme::BTN_H_SM)),
-                        );
-
-                        ui.add_space(Theme::SP_SM);
-
-                        // Scope button
-                        let (scope_fill, scope_text) = if drive.scope.is_empty() {
-                            (Theme::SUCCESS_LIGHT, "All Users")
-                        } else {
-                            (Theme::ACCENT_SUBTLE, "Current User")
-                        };
-
-                        let scope_response = ui.add_enabled(
-                            !mount_loading || !elevated(),
-                            egui::Button::new(
-                                RichText::new(scope_text)
-                                    .size(12.0)
-                                    .color(Theme::TEXT_PRIMARY),
-                            )
-                                .fill(scope_fill)
-                                .stroke(Stroke::new(1.0, Theme::BORDER))
-                                .corner_radius(Theme::RADIUS_SM)
-                                .min_size(Vec2::new(90.0, Theme::BTN_H_SM)),
-                        );
-
-                        // ── Scope click handler ─────────────────────
-                        if scope_response.clicked() {
-                            drive.scope = if drive.scope.is_empty() {
-                                get_user_id().unwrap_or_default()
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                        ui.horizontal(|ui| {
+                            // Mount / Unmount button
+                            let (button_text, button_fill, text_color, btn_stroke) = if drive.mounted {
+                                ("Unmount", Theme::ACCENT_SUBTLE, Theme::TEXT_PRIMARY, Stroke::new(1.0, Theme::BORDER))
                             } else {
-                                String::new()
+                                ("Mount", Theme::ACCENT, Theme::TEXT_WHITE, Stroke::NONE)
                             };
 
+                            let button_response = ui.add_enabled(
+                                !mount_loading,
+                                egui::Button::new(
+                                    RichText::new(button_text)
+                                        .size(12.0)
+                                        .color(text_color),
+                                )
+                                    .fill(button_fill)
+                                    .stroke(btn_stroke)
+                                    .corner_radius(Theme::RADIUS_SM)
+                                    .min_size(Vec2::new(80.0, Theme::BTN_H_SM)),
+                            );
+
+                            // Scope and Compress only visible when mounted
+                            let mut scope_response: Option<egui::Response> = None;
+                            let mut compress_changed = false;
+
                             if drive.mounted {
-                                let socketaddr = connection.ip_addr;
-                                let mount_path = drive.mount_path.clone();
+                                ui.add_space(Theme::SP_SM);
+
+                                // Scope button
+                                let (scope_fill, scope_text) = if drive.scope.is_empty() {
+                                    (Theme::SUCCESS_LIGHT, "All Users")
+                                } else {
+                                    (Theme::ACCENT_SUBTLE, "Current User")
+                                };
+
+                                scope_response = Some(ui.add_enabled(
+                                    !mount_loading && elevated(),
+                                    egui::Button::new(
+                                        RichText::new(scope_text)
+                                            .size(12.0)
+                                            .color(Theme::TEXT_PRIMARY),
+                                    )
+                                        .fill(scope_fill)
+                                        .stroke(Stroke::new(1.0, Theme::BORDER))
+                                        .corner_radius(Theme::RADIUS_SM)
+                                        .min_size(Vec2::new(90.0, Theme::BTN_H_SM)),
+                                ));
+
+                                ui.add_space(Theme::SP_SM);
+
+                                // Compress toggle
+                                ui.add_enabled_ui(!mount_loading, |ui| {
+                                    if toggle(ui, &mut drive.compress).clicked() {
+                                        compress_changed = true;
+                                    }
+                                    ui.label(
+                                        RichText::new("Compress")
+                                            .size(12.0)
+                                            .color(Theme::TEXT_PRIMARY),
+                                    );
+                                });
+                            }
+
+                            // ── Scope click handler ─────────────────────
+                            if let Some(resp) = scope_response {
+                                if resp.clicked() {
+                                    drive.scope = if drive.scope.is_empty() {
+                                        get_user_id().unwrap_or_default()
+                                    } else {
+                                        String::new()
+                                    };
+
+                                    let mount_point = drive.mount_path.clone();
+                                    let username = username.clone();
+                                    let drive_mount = drive.server_mount_point.clone();
+                                    let scope = drive.scope.clone();
+                                    let compress = drive.compress;
+
+                                    let _ = self.connect_bind.read_or_request(|| {
+                                        async move {
+                                            match send_command_to_daemon(SocketCommand::Mount {
+                                                mount_point,
+                                                drive: drive_mount,
+                                                socketaddr: ip_addr,
+                                                username,
+                                                scope,
+                                                compress,
+                                            }).await {
+                                                Ok(_) => {
+                                                    match send_command_to_daemon(SocketCommand::Volumes {
+                                                        user_id: get_user_id().unwrap_or_default(),
+                                                        connection: None,
+                                                        elevated: elevated(),
+                                                    }).await {
+                                                        Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => Ok(connections),
+                                                        _ => Ok(vec![]),
+                                                    }
+                                                }
+                                                Err(e) => Err(e.to_string()),
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+
+                            // ── Compress toggle handler ──────────────────
+                            if compress_changed {
+                                let mount_point = drive.mount_path.clone();
                                 let username = username.clone();
+                                let drive_mount = drive.server_mount_point.clone();
                                 let scope = drive.scope.clone();
+                                let compress = drive.compress;
 
                                 let _ = self.connect_bind.read_or_request(|| {
                                     async move {
-                                        match send_command_to_daemon(SocketCommand::Scope {
-                                            scope,
+                                        match send_command_to_daemon(SocketCommand::Mount {
+                                            mount_point,
+                                            drive: drive_mount,
+                                            socketaddr: ip_addr,
                                             username,
-                                            socketaddr,
-                                            mount_point: mount_path,
+                                            scope,
+                                            compress,
                                         }).await {
                                             Ok(_) => {
                                                 match send_command_to_daemon(SocketCommand::Volumes {
@@ -669,52 +703,53 @@ impl DriveManagerApp {
                                     }
                                 });
                             }
-                        }
 
-                        // ── Mount click handler ─────────────────────
-                        if button_response.clicked() {
-                            let (socket_command, operation) = if !drive.mounted {
-                                (SocketCommand::Mount {
-                                    mount_point: drive.editable_mount.clone(),
-                                    drive: drive.server_mount_point.clone(),
-                                    socketaddr: ip_addr,
-                                    username: username.clone(),
-                                    scope: drive.scope.clone(),
-                                }, Operation::MOUNT)
-                            } else {
-                                (SocketCommand::UnMount {
-                                    username,
-                                    socketaddr: ip_addr,
-                                    mount_point: drive.mount_path.clone(),
-                                }, Operation::MOUNT)
-                            };
+                            // ── Mount click handler ─────────────────────
+                            if button_response.clicked() {
+                                let (socket_command, operation) = if !drive.mounted {
+                                    (SocketCommand::Mount {
+                                        mount_point: drive.mount_path.clone(),
+                                        drive: drive.server_mount_point.clone(),
+                                        socketaddr: ip_addr,
+                                        username: username.clone(),
+                                        scope: drive.scope.clone(),
+                                        compress: drive.compress,
+                                    }, Operation::MOUNT)
+                                } else {
+                                    (SocketCommand::UnMount {
+                                        username,
+                                        socketaddr: ip_addr,
+                                        mount_point: drive.mount_path.clone(),
+                                    }, Operation::MOUNT)
+                                };
 
-                            debug!("Mount button was clicked");
+                                debug!("Mount button was clicked");
 
-                            let bind = Bind::new(false);
-                            self.drive_bind.insert((drive.server_mount_point.to_string(), operation.clone()), bind);
-                            let got_bind = self.drive_bind
-                                .get_mut(&(drive.server_mount_point.to_string(), operation))
-                                .expect("Insert just succeeded");
+                                let bind = Bind::new(false);
+                                self.drive_bind.insert((drive.server_mount_point.to_string(), operation.clone()), bind);
+                                let got_bind = self.drive_bind
+                                    .get_mut(&(drive.server_mount_point.to_string(), operation))
+                                    .expect("Insert just succeeded");
 
-                            got_bind.read_mut_or_request(|| {
-                                async move {
-                                    match send_command_to_daemon(socket_command).await {
-                                        Ok(_) => {
-                                            match send_command_to_daemon(SocketCommand::Volumes {
-                                                user_id: get_user_id().unwrap_or_default(),
-                                                connection: Some(conn_clone),
-                                                elevated: elevated(),
-                                            }).await {
-                                                Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => Ok(connections),
-                                                _ => Ok(vec![]),
+                                got_bind.read_mut_or_request(|| {
+                                    async move {
+                                        match send_command_to_daemon(socket_command).await {
+                                            Ok(_) => {
+                                                match send_command_to_daemon(SocketCommand::Volumes {
+                                                    user_id: get_user_id().unwrap_or_default(),
+                                                    connection: Some(conn_clone),
+                                                    elevated: elevated(),
+                                                }).await {
+                                                    Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => Ok(connections),
+                                                    _ => Ok(vec![]),
+                                                }
                                             }
+                                            Err(e) => Err(e.to_string()),
                                         }
-                                        Err(e) => Err(e.to_string()),
                                     }
-                                }
-                            });
-                        }
+                                });
+                            }
+                        });
                     });
                 });
             });
@@ -729,13 +764,15 @@ impl DriveManagerApp {
                             if let Some(existing_conn) = self.connections.iter_mut()
                                 .find(|c| c.ip_addr == new_conn.ip_addr && c.username == new_conn.username)
                             {
-                                for new_drive in &new_conn.drive {
-                                    if let Some(existing_drive) = existing_conn.drive.iter_mut()
-                                        .find(|d| d.server_mount_point == new_drive.server_mount_point)
-                                    {
-                                        *existing_drive = new_drive.clone();
-                                    }
+                                if new_conn.drive.is_empty() {
+                                    // Server returned no drives — update in place
+                                    // to preserve current UI state rather than
+                                    // wiping everything
+                                    continue;
                                 }
+                                // Replace the entire drive list so newly mounted/
+                                // unmounted drives are reflected
+                                existing_conn.drive = new_conn.drive;
                             }
                         }
                     } else if bind.is_err() {
@@ -965,7 +1002,7 @@ impl ConnectDriveDialog {
                                 .corner_radius(Theme::RADIUS_SM)
                                 .min_size([90.0, Theme::BTN_H].into()),
                         ).clicked() {
-                            ui.close();
+                            self.open = false;
                         }
 
                         ui.add_space(ui.available_width() - 90.0);

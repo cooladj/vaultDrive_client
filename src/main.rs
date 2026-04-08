@@ -11,6 +11,7 @@ use service_manager::ServiceLabel;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tracing::Level;
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 
@@ -56,7 +57,7 @@ static RUNTIME_HANDLE: OnceCell<Handle> = OnceCell::new();
 #[tokio::main]
 async fn main() -> Result<()> {
 
-    init_logging(is_daemon_process())?;
+    let guard = init_logging(is_daemon_process())?;
 
     if deamonize::is_daemon_process() {
         info!("Starting daemon process");
@@ -245,6 +246,8 @@ fn windows_service_handler(_arguments: Vec<OsString>) -> Result<()> {
     let handle = RUNTIME_HANDLE.get()
         .ok_or_else(|| anyhow::anyhow!("Runtime handle not initialized"))?;
 
+    debug!("number of tokio worker: {:?}", handle.metrics().num_workers());
+
     let abort_handle = handle.spawn(async move {
         if let Err(e) = deamonize::run_daemon_server().await {
             tracing::error!(" failed to start server {}", e);
@@ -283,19 +286,27 @@ fn windows_service_handler(_arguments: Vec<OsString>) -> Result<()> {
     Ok(())
 }
 
-fn init_logging(is_service: bool) -> Result<()> {
+fn init_logging(is_service: bool) -> Result<WorkerGuard> {
+    let level = if cfg!(debug_assertions) {
+        Level::DEBUG
+    } else {
+        Level::INFO
+    };
+
     let subscriber = tracing_subscriber::fmt()
         .with_target(false)
         .with_thread_ids(false)
         .with_level(true)
-        .with_max_level(Level::DEBUG);
+        .with_max_level(level);
 
     if is_service {
         let log_path = env::temp_dir().join("vaultDrive_client_service.log");
         let file = File::create(&log_path)?;
-        subscriber.with_writer(file).init();
+        let (non_blocking, guard) = tracing_appender::non_blocking(file);
+        subscriber.with_writer(non_blocking).init();
+        Ok(guard)
     } else {
         subscriber.init();
+        Ok(tracing_appender::non_blocking(std::io::stdout()).1)
     }
-    Ok(())
 }

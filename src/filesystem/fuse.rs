@@ -1241,8 +1241,7 @@ impl Filesystem for VirtualFileSystem {
     fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
         debug!("access: ino={}, mask={:#x}", ino, mask);
 
-        // For simplicity, always allow access
-        // A full implementation would check the file's permissions
+
         // probably need to get file_info than compare the mask with the flags 
         // if ok return ok if false return .err
         reply.ok();
