@@ -431,6 +431,21 @@ impl VaultDriveClient {
             _ => bail!("Unexpected response type for list directory"),
         }
     }
+    pub async fn flush_file(&self,  file_id: u64,include_file_info: Option<bool>
+    ) -> Result<OperationSuccessResponse> {
+        let request = Request {
+            request_type: Some(request::RequestType::FlushFile(FlushFileRequest {
+                file_id,
+                include_file_info,
+            })),
+        };
+        let response = self.execute_request(request).await?;
+        match response.response_type {
+            Some(response::ResponseType::OperationSuccess(success)) => Ok(success),
+            _ => bail!("Unexpected response type for delete file"),
+        }
+
+    }
 
     pub async fn get_file_info(&self, path: &str) -> Result<FileInfoResponse>
     {

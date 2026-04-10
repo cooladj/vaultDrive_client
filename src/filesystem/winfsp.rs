@@ -19,6 +19,7 @@ use bytes::Bytes;
 use tokio::sync::OnceCell;
 use once_cell::sync::{Lazy};
 use dashmap::DashMap;
+use futures::{FutureExt, SinkExt};
 use log::debug;
 use path_slash::PathExt;
 use strum_macros::Display;
@@ -48,7 +49,7 @@ use winfsp::{FspError, U16CStr, U16CString};
 use winfsp::constants::FspCleanupFlags::FspCleanupSetAllocationSize;
 use winfsp::FspError::NTSTATUS;
 use winfsp_sys::FILE_FLAGS_AND_ATTRIBUTES;
-use x509_parser::nom::AsBytes;
+use x509_parser::nom::{AsBytes, Parser};
 use crate::filesystem::{InodeAllocator, APPEND, DELETE, DELETE_CHILDREN, DSYNC, EXCL, EXCLUSIVE_LOCK, READ, SHARE_LOCK, SYNC, TRANSVERSE, WINDOW_SHARE_DELETE, WINDOW_SHARE_READ, WINDOW_SHARE_WRITE, WRITE};
 use crate::proto;
 
@@ -706,68 +707,73 @@ fn close(&self, context: Self::FileContext) {
     )  {
         debug!("cleanup was called");
         if (flags & FSP_CLEANUP_DELETE) == 0 {
-            return;
-        }
+            let context = context.clone();
+            let self_clone= self.clone();
 
-        let open_ctx = match self.open_files.get(context) {
-            Some(ctx) => ctx,
-            None => {
-                tracing::error!("cleanup: invalid handle");
-                return;
-            }
-        };
-
-        if open_ctx.is_directory {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let path = open_ctx.path.clone();
-
-            let self_clone = self.clone();
 
             self.handle.spawn(async move {
-                let result = self_clone.get_or_fetch_directory_list(&path).await;
-                let _ = tx.send(result);
-            });
+                tx.send( self_clone.flush_pending_writes(&context).await);
 
-            let entries = match rx.blocking_recv() {
-                Ok(Ok(e)) => e,
-                Ok(Err(e)) => {
-                    tracing::error!("cleanup: failed to fetch dir list: {:?}", e);
-                    return;
-                }
-                Err(_) => {
-                    tracing::error!("cleanup: oneshot channel closed");
+            });
+            rx.blocking_recv();
+        }else {
+            let open_ctx = match self.open_files.get(context) {
+                Some(ctx) => ctx,
+                None => {
+                    tracing::error!("cleanup: invalid handle");
                     return;
                 }
             };
 
-            if !entries.is_empty() {
-                tracing::warn!("cleanup: directory not empty, skipping delete: {:?}", open_ctx.path);
-                return;
+            if open_ctx.is_directory  {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let path = open_ctx.path.clone();
+
+                let self_clone = self.clone();
+
+                self.handle.spawn(async move {
+                    let result = self_clone.get_or_fetch_directory_list(&path).await;
+                    let _ = tx.send(result);
+                });
+
+                let entries = match rx.blocking_recv() {
+                    Ok(Ok(e)) => e,
+                    Ok(Err(e)) => {
+                        tracing::error!("cleanup: failed to fetch dir list: {:?}", e);
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::error!("cleanup: oneshot channel closed");
+                        return;
+                    }
+                };
+
+                if !entries.is_empty() {
+                    tracing::warn!("cleanup: directory not empty, skipping delete: {:?}", open_ctx.path);
+                    return;
+                }
             }
-        }
+                let unix_path = self.to_unix_path(&open_ctx.path);
+                let client = self.client.clone(); // Clone before moving into async block
+                let (tx, rx) = oneshot::channel();
 
-        // Delete on server
-        if open_ctx.is_marked_deleted {
-            let unix_path = self.to_unix_path(&open_ctx.path);
-            let client = self.client.clone(); // Clone before moving into async block
-            let (tx, rx) = oneshot::channel();
+                self.handle.spawn(async move {
+                    let result = client.delete_file(&unix_path).await;
+                    let _ = tx.send(result); // Ignore send errors (receiver might be dropped)
+                });
 
-            self.handle.spawn(async move {
-                let result = client.delete_file(&unix_path).await;
-                let _ = tx.send(result); // Ignore send errors (receiver might be dropped)
-            });
-
-            match rx.blocking_recv() {
-                Ok(Ok(())) => {
-
+                match rx.blocking_recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::error!("cleanup: failed to delete file: {:?}", e);
+                    }
+                    Err(e) => {
+                        tracing::error!("cleanup: channel recv failed: {}", e);
+                    }
                 }
-                Ok(Err(e)) => {
-                    tracing::error!("cleanup: failed to delete file: {:?}", e);
-                }
-                Err(e) => {
-                    tracing::error!("cleanup: channel recv failed: {}", e);
-                }
-            }
+                self.flushable_writes.remove(context);
+
         }
     }
     fn overwrite(&self, context: &Self::FileContext, file_attributes: FILE_FLAGS_AND_ATTRIBUTES, replace_file_attributes: bool, allocation_size: u64, extra_buffer: Option<&[u8]>, file_info: &mut FileInfo) -> Result<(), FspError> {
@@ -938,7 +944,6 @@ fn close(&self, context: Self::FileContext) {
         Ok(())
     }
 
-    ///todo
 
     fn set_delete(
         &self,
@@ -960,6 +965,7 @@ fn close(&self, context: Self::FileContext) {
         context: Option<&Self::FileContext>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        debug!("flush was called");
         if let Some(context) = context {
             let open_ctx = self.open_files
                 .get(context)
@@ -969,30 +975,50 @@ fn close(&self, context: Self::FileContext) {
             if open_ctx.is_marked_deleted {
                 self.flushable_writes.remove(context);
             } else {
-                let self_clone= self.clone();
+                let self_clone = self.clone();
                 let context = context.clone();
                 let (tx, rx) = tokio::sync::oneshot::channel();
 
                 self.handle.spawn(async move {
                     self_clone.flush_pending_writes(&context).await;
-                    let node = self_clone.get_or_fetch_file_info(open_ctx.path.as_str()).await;
-                    let _ = tx.send(node);
+
+                    let result: Result<FileNode, i32> = match self_clone.client.flush_file( context, Some(true)).await {
+                        Ok(node) => {
+                            if let Some(info) = node.file_info {
+                                Ok(FileNode::from_file_info(info))
+                            } else {
+                                self_clone.get_or_fetch_file_info(open_ctx.path.as_str()).await
+                                    .map_err(|_| STATUS_IO_DEVICE_ERROR.0)
+                            }
+                        }
+                        Err(_err) => Err(STATUS_IO_DEVICE_ERROR.0),
+                    };
+
+                    let _ = tx.send(result);
                 });
 
-                if let Ok(Ok(node)) = rx.blocking_recv() {
-                    *file_info = FileInfo {
-                        file_attributes: node.file_attributes,
-                        reparse_tag: 0,
-                        allocation_size: ((node.size as u64 + 4095) / 4096) * 4096,
-                        file_size: node.size as u64,
-                        creation_time: system_time_to_filetime(node.creation_time),
-                        last_access_time: system_time_to_filetime(node.last_access_time),
-                        last_write_time: system_time_to_filetime(node.last_write_time),
-                        change_time: system_time_to_filetime(node.last_write_time),
-                        index_number: 0,
-                        hard_links: 0,
-                        ea_size: 0,
-                    };
+                match rx.blocking_recv() {
+                    Ok(Ok(node)) => {
+                        *file_info = FileInfo {
+                            file_attributes: node.file_attributes,
+                            reparse_tag: 0,
+                            allocation_size: ((node.size as u64 + 4095) / 4096) * 4096,
+                            file_size: node.size as u64,
+                            creation_time: system_time_to_filetime(node.creation_time),
+                            last_access_time: system_time_to_filetime(node.last_access_time),
+                            last_write_time: system_time_to_filetime(node.last_write_time),
+                            change_time: system_time_to_filetime(node.last_write_time),
+                            index_number: 0,
+                            hard_links: 0,
+                            ea_size: 0,
+                        };
+                    }
+                    Ok(Err(status)) => {
+                        return Err(FspError::from(NTSTATUS(status)))
+                    }
+                    Err(_) => {
+                        return Err(FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))
+                    }
                 }
             }
         }
@@ -1132,7 +1158,7 @@ impl AsyncFileSystemContext for VirtualFileSystem {
                     .spawn({
                         let buffer = buffer.to_vec();
                         async move{
-                            client.write_file(&path, offset, &buffer, context.clone(), flags + SYNC, compress, is_compressed, Some(false))
+                            client.write_file(&path, offset, &buffer, context.clone(), flags, compress, is_compressed, Some(false))
                                 .await
                         }
                     });

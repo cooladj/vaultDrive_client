@@ -8,27 +8,24 @@ package vaultdrive;
 
 message unix_forward_req {
   oneof unix_forward_req_type {
-    ForwardReq req = 1;
     bool spindown = 2;
   }
 }
+message unix_forward_remove{
+  uint64 connection_id =1;
+  RemoveRequest remove = 2;
 
-message ForwardReq {
-  int64 connection_id = 1;
-  Request request = 2;
 }
+
+
 
 message unix_forward_res {
   oneof unix_forward_res_type {
-    ForwardRes res = 1;
+    unix_forward_remove remove =1;
     bool spindown = 2;
   }
 }
 
-message ForwardRes {
-  int64 connection_id = 1;
-  Response response = 2;
-}
 
 
 message Request {
@@ -51,6 +48,7 @@ message Request {
     OverrideFileRequest override_file = 17;
     ReAuthenticateRequest reauthenticate = 18;
     RemoveRequest remove = 19;
+    FlushFileRequest flush_file = 20;
   }
 }
 
@@ -159,6 +157,13 @@ message WriteFileRequest {
   bool compressed = 7;
 
   optional bool include_file_info =8;
+}
+
+message FlushFileRequest{
+  string path = 1;
+  uint64 file_id =5;
+  optional bool include_file_info =8;
+
 }
 
 message LockRequest{

@@ -51,7 +51,7 @@ pub struct ForwardRes {
 pub struct Request {
     #[prost(
         oneof = "request::RequestType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20"
     )]
     pub request_type: ::core::option::Option<request::RequestType>,
 }
@@ -95,6 +95,8 @@ pub mod request {
         Reauthenticate(super::ReAuthenticateRequest),
         #[prost(message, tag = "19")]
         Remove(super::RemoveRequest),
+        #[prost(message, tag = "20")]
+        FlushFile(super::FlushFileRequest),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -229,6 +231,13 @@ pub struct WriteFileRequest {
     pub flags: u32,
     #[prost(bool, tag = "7")]
     pub compressed: bool,
+    #[prost(bool, optional, tag = "8")]
+    pub include_file_info: ::core::option::Option<bool>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FlushFileRequest {
+    #[prost(uint64, tag = "5")]
+    pub file_id: u64,
     #[prost(bool, optional, tag = "8")]
     pub include_file_info: ::core::option::Option<bool>,
 }
