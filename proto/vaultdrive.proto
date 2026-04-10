@@ -156,13 +156,12 @@ message WriteFileRequest {
   uint32 flags =6;
   bool compressed = 7;
 
-  optional bool include_file_info =8;
+  optional bool include_file_info = 8;
 }
 
 message FlushFileRequest{
-  string path = 1;
   uint64 file_id =5;
-  optional bool include_file_info =8;
+  optional bool include_file_info = 8;
 
 }
 

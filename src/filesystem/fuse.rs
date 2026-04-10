@@ -7,14 +7,11 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
-    ReplyWrite, Request, TimeOrNow, FUSE_ROOT_ID,
-};
+use fuser::{FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, INodeNo, KernelConfig, Generation, FileHandle, OpenFlags, FopenFlags, LockOwner, WriteFlags, RenameFlags, AccessFlags};
 use libc::{chown, EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
@@ -130,7 +127,7 @@ impl FileNode {
         };
 
         FileAttr {
-            ino: self.ino,
+            ino: INodeNo(self.ino),
             size: self.size as u64,
             blocks,
             atime: self.last_access_time,
@@ -209,15 +206,18 @@ pub struct VirtualFileSystem {
     pending_dir_requests: Arc<DashMap<String, Arc<OnceCell<Vec<DirectoryEntry>>>>>,
     
     lookup_counts: Arc<DashMap<u64, u64>>,
-    scope: String,
 
+
+    scope: Arc<RwLock<String>>,
+
+    compress: Arc<AtomicBool>,
 
     uid: u32,
     gid: u32,
 }
 
 impl VirtualFileSystem {
-    pub fn new(client: Arc<VaultDriveClient>, handle: Handle, drive: &str) -> Self {
+    pub fn new(client: Arc<VaultDriveClient>, handle: Handle, drive: &str,scope: Arc<RwLock<String>>, compress: Arc<AtomicBool>,) -> Self {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
 
@@ -225,7 +225,7 @@ impl VirtualFileSystem {
             client,
             handle,
             drive: Arc::new(RwLock::new(drive.to_string())),
-            inode_allocator: Arc::new(InodeAllocator::new(FUSE_ROOT_ID + 1)),
+            inode_allocator: Arc::new(InodeAllocator::new(INodeNo::ROOT.0 + 1)),
             path_to_inode: Arc::new(DashMap::new()),
             inode_to_node: Arc::new(DashMap::new()),
             fh_allocator: Arc::new(InodeAllocator::new(1)),
@@ -233,11 +233,13 @@ impl VirtualFileSystem {
             pending_file_requests: Arc::new(DashMap::new()),
             pending_dir_requests: Arc::new(DashMap::new()),
             lookup_counts: Arc::new(DashMap::new()),
+            scope,
+            compress,
             uid,
             gid,
         };
 
-        fs.path_to_inode.insert("/".to_string(), FUSE_ROOT_ID);
+        fs.path_to_inode.insert("/".to_string(), INodeNo::ROOT.0);
 
         fs
     }
@@ -270,7 +272,7 @@ impl VirtualFileSystem {
     }
 
     fn build_path(&self, parent: u64, name: &OsStr) -> Option<String> {
-        let parent_path = if parent == FUSE_ROOT_ID {
+        let parent_path = if parent == INodeNo::ROOT.0 {
             "/".to_string()
         } else {
             self.get_path(parent)?
@@ -415,11 +417,7 @@ impl VirtualFileSystem {
 
 
 impl Filesystem for VirtualFileSystem {
-    fn init(
-        &mut self,
-        _req: &Request<'_>,
-        _config: &mut fuser::KernelConfig,
-    ) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request, _config: &mut KernelConfig)  -> Result<(), libc::c_int> {
         info!("FUSE filesystem initialized");
         Ok(())
     }
@@ -427,35 +425,35 @@ impl Filesystem for VirtualFileSystem {
     fn destroy(&mut self) {
         info!("FUSE filesystem destroyed");
     }
-    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        debug!("forget: ino={}, nlookup={}", ino, nlookup);
+    fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {
+        debug!("forget: ino={}, nlookup={}", _ino, _nlookup);
 
-        if ino == FUSE_ROOT_ID {
+        if _ino == INodeNo::ROOT {
             return;
         }
 
         let should_remove = self
             .lookup_counts
-            .get_mut(&ino)
+            .get_mut(&_ino.0)
             .map(|mut count| {
-                *count = count.saturating_sub(nlookup);
+                *count = count.saturating_sub(_nlookup);
                 *count == 0
             })
             .unwrap_or(true);
 
         if should_remove {
-            self.lookup_counts.remove(&ino);
-            if let Some((_, node)) = self.inode_to_node.remove(&ino) {
+            self.lookup_counts.remove(&_ino.0);
+            if let Some((_, node)) = self.inode_to_node.remove(&_ino.0) {
                 self.path_to_inode.remove(&node.path);
-                debug!("forget: removed inode {} (path: {})", ino, node.path);
+                debug!("forget: removed inode {} (path: {})", _ino.0, node.path);
             }
         }
     }
 
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        debug!("lookup: parent={}, name={:?}", parent, name);
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry)  {
+        debug!("lookup: parent={}, name={:?}", parent.0, name);
 
-        let path = match self.build_path(parent, name) {
+        let path = match self.build_path(parent.0, name) {
             Some(p) => p,
             None => {
                 reply.error(ENOENT);
@@ -471,7 +469,7 @@ impl Filesystem for VirtualFileSystem {
                     .or_insert(1);
 
                 let attr = node.to_file_attr(self.uid, self.gid);
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&TTL, &attr, Generation);
             }
             Err(e) => {
                 reply.error(e);
@@ -479,21 +477,21 @@ impl Filesystem for VirtualFileSystem {
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         debug!("getattr: ino={}", ino);
 
         // Handle root inode specially
-        if ino == FUSE_ROOT_ID {
+        if ino == INodeNo::ROOT {
             match self.get_or_fetch_file_info_blocking("/") {
                 Ok(node) => {
                     let mut attr = node.to_file_attr(self.uid, self.gid);
-                    attr.ino = FUSE_ROOT_ID;
+                    attr.ino = INodeNo::ROOT;
                     reply.attr(&TTL, &attr);
                 }
                 Err(_) => {
                     // Return default root attributes
                     let attr = FileAttr {
-                        ino: FUSE_ROOT_ID,
+                        ino: INodeNo::ROOT,
                         size: 0,
                         blocks: 0,
                         atime: UNIX_EPOCH,
@@ -535,53 +533,12 @@ impl Filesystem for VirtualFileSystem {
         }
     }
 
-    /// Set file attributes
-    fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
-        _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
-        reply: ReplyAttr,
-    ) {
-        debug!("setattr: ino={}, size={:?}", ino, size);
-
-        // For now, just return current attributes
-        //todo add implenment for both windows and unix
-        let path = match self.get_path(ino) {
-            Some(p) => p,
-            None => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        match self.get_or_fetch_file_info_blocking(&path) {
-            Ok(node) => {
-                let attr = node.to_file_attr(self.uid, self.gid);
-                reply.attr(&TTL, &attr);
-            }
-            Err(e) => {
-                reply.error(e);
-            }
-        }
-    }
 
     /// Open a file
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        debug!("open: ino={}, flags={:#x}", ino, flags);
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        debug!("open: ino={}, flags={:#x}", _ino, _flags);
 
-        let path = match self.get_path(ino) {
+        let path = match self.get_path(_ino.0) {
             Some(p) => p,
             None => {
                 reply.error(ENOENT);
@@ -589,7 +546,7 @@ impl Filesystem for VirtualFileSystem {
             }
         };
 
-        let internal_flags = self.convert_open_flags(flags);
+        let internal_flags = self.convert_open_flags(_flags.0);
         let fh = self.fh_allocator.allocate();
 
         let client = self.client.clone();
@@ -612,7 +569,8 @@ impl Filesystem for VirtualFileSystem {
                     fh,
                 };
                 self.open_files.insert(fh, ctx);
-                reply.opened(fh, 0);
+
+                reply.opened(FileHandle(fh), FopenFlags());
             }
             Ok(Err(e)) => {
                 error!("open: failed to open file: {:?}", e);
@@ -627,19 +585,19 @@ impl Filesystem for VirtualFileSystem {
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        flags: OpenFlags,
+        lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
         debug!("read: ino={}, fh={}, offset={}, size={}", ino, fh, offset, size);
 
-        let ctx = match self.open_files.get(&fh) {
+        let ctx = match self.open_files.get(&fh.0) {
             Some(c) => c.clone(),
             None => {
                 reply.error(ENOENT);
@@ -653,7 +611,7 @@ impl Filesystem for VirtualFileSystem {
 
         self.handle.spawn(async move {
             let result = client
-                .read_file(&ctx.path, offset as u64, size, fh)
+                .read_file(&ctx.path, offset as u64, size, fh.0, self.compress)
                 .await;
             let _ = tx.send(result);
         });
@@ -673,15 +631,15 @@ impl Filesystem for VirtualFileSystem {
     }
 
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        write_flags: WriteFlags,
+        flags: OpenFlags,
+        lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
         debug!(
@@ -692,7 +650,7 @@ impl Filesystem for VirtualFileSystem {
             data.len()
         );
 
-        let ctx = match self.open_files.get(&fh) {
+        let ctx = match self.open_files.get(&fh.0) {
             Some(c) => c.clone(),
             None => {
                 reply.error(ENOENT);
@@ -701,21 +659,20 @@ impl Filesystem for VirtualFileSystem {
         };
 
         let client = self.client.clone();
-        let data_vec = data.to_vec();
         let flags = ctx.flags;
 
         let (tx, rx) = oneshot::channel();
 
         self.handle.spawn(async move {
             let result = client
-                .write_file(&ctx.path, offset as u64, data_vec.clone(), fh, flags)
+                .write_file(&ctx.path, offset as u64, data, fh.0, flags, None)
                 .await;
-            let _ = tx.send(result.map(|_| data_vec.len()));
+            let _ = tx.send(result);
         });
 
         match rx.blocking_recv() {
             Ok(Ok(written)) => {
-                reply.written(written as u32);
+                reply.written(written.bytes_written as u32);
             }
             Ok(Err(e)) => {
                 error!("write: failed: {:?}", e);
@@ -729,7 +686,7 @@ impl Filesystem for VirtualFileSystem {
 
     fn flush(
         &mut self,
-        _req: &Request<'_>,
+        _req: &Request,
         ino: u64,
         fh: u64,
         _lock_owner: u64,
@@ -740,24 +697,24 @@ impl Filesystem for VirtualFileSystem {
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        debug!("release: ino={}, fh={}", ino, fh);
+        debug!("release: ino={}, fh={}", _ino, _fh);
 
-        if let Some((_, ctx)) = self.open_files.remove(&fh) {
+        if let Some((_, ctx)) = self.open_files.remove(&_fh.0) {
             let client = self.client.clone();
 
             let (tx, rx) = oneshot::channel();
 
             self.handle.spawn(async move {
-                let result = client.close_file(fh).await;
+                let result = client.close_file(_fh.0).await;
                 let _ = tx.send(result);
             });
 
@@ -771,19 +728,19 @@ impl Filesystem for VirtualFileSystem {
                 }
             }
 
-            self.fh_allocator.free(fh);
+            self.fh_allocator.free(_fh.0);
         }
 
         reply.ok();
     }
 
-    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        debug!("opendir: ino={}", ino);
+    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        debug!("opendir: ino={}", _ino.0);
 
-        let path = if ino == FUSE_ROOT_ID {
+        let path = if ino == INodeNo::ROOT.0 {
             "/".to_string()
         } else {
-            match self.get_path(ino) {
+            match self.get_path(_ino.0) {
                 Some(p) => p,
                 None => {
                     reply.error(ENOENT);
@@ -802,20 +759,20 @@ impl Filesystem for VirtualFileSystem {
         };
         self.open_files.insert(fh, ctx);
 
-        reply.opened(fh, 0);
+        reply.opened(FileHandle(fh), 0);
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        reply: ReplyDirectory,
+    ){
         debug!("readdir: ino={}, fh={}, offset={}", ino, fh, offset);
 
-        let ctx = match self.open_files.get(&fh) {
+        let ctx = match self.open_files.get(&fh.0) {
             Some(c) => c.clone(),
             None => {
                 reply.error(ENOENT);
@@ -836,10 +793,10 @@ impl Filesystem for VirtualFileSystem {
             }
         };
 
-        let mut current_offset = 0i64;
+        let mut current_offset = 0u64;
 
         if offset <= current_offset {
-            if reply.add(ino, current_offset + 1, FileType::Directory, ".") {
+            if reply.add(ino, (current_offset + 1) as u64, FileType::Directory, ".") {
                 reply.ok();
                 return;
             }
@@ -847,17 +804,17 @@ impl Filesystem for VirtualFileSystem {
         current_offset += 1;
 
         if offset <= current_offset {
-            let parent_ino = if ino == FUSE_ROOT_ID {
-                FUSE_ROOT_ID
+            let parent_ino = if ino == INodeNo::ROOT {
+                INodeNo::ROOT.0
             } else {
                 let parent_path = Path::new(&ctx.path)
                     .parent()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| "/".to_string());
-                self.get_inode(&parent_path).unwrap_or(FUSE_ROOT_ID)
+                self.get_inode(&parent_path).unwrap_or(INodeNo::ROOT.0)
             };
 
-            if reply.add(parent_ino, current_offset + 1, FileType::Directory, "..") {
+            if reply.add(INodeNo(parent_ino), (current_offset + 1) as u64, FileType::Directory, "..") {
                 reply.ok();
                 return;
             }
@@ -881,7 +838,7 @@ impl Filesystem for VirtualFileSystem {
                 let node = FileNode::from_directory_entry(entry, &ctx.path, entry_ino);
                 self.store_node(node);
 
-                if reply.add(entry_ino, current_offset + 1, file_type, &entry.name) {
+                if reply.add(INodeNo(entry_ino), (current_offset + 1) as u64, file_type, &entry.name) {
                     reply.ok();
                     return;
                 }
@@ -893,20 +850,21 @@ impl Filesystem for VirtualFileSystem {
     }
 
     fn releasedir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _flags: i32,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
         reply: ReplyEmpty,
-    ) {
-        debug!("releasedir: ino={}, fh={}", ino, fh);
+    )
+    {
+        debug!("releasedir: ino={}, fh={}", _ino, _fh);
 
-        if let Some((_, _ctx)) = self.open_files.remove(&fh) {
+        if let Some((_, _ctx)) = self.open_files.remove(&_fh.0) {
             let (tx, rx) = oneshot::channel();
             let client = self.client.clone();
             self.handle.spawn(async move {
-                let result = client.close_file(fh).await;
+                let result = client.close_file(_fh.0).await;
                 let _ = tx.send(result);
             });
 
@@ -919,25 +877,25 @@ impl Filesystem for VirtualFileSystem {
                     error!("release: channel recv failed");
                 }
             }
-            self.fh_allocator.free(fh);
+            self.fh_allocator.free(_fh.0);
         }
 
         reply.ok();
     }
 
     fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         flags: i32,
         reply: ReplyCreate,
     ) {
         debug!("create: parent={}, name={:?}, flags={:#x}", parent, name, flags);
 
-        let path = match self.build_path(parent, name) {
+        let path = match self.build_path(parent.0, name) {
             Some(p) => p,
             None => {
                 reply.error(EINVAL);
@@ -973,7 +931,7 @@ impl Filesystem for VirtualFileSystem {
                         self.open_files.insert(fh, ctx);
 
                         let attr = node.to_file_attr(self.uid, self.gid);
-                        reply.created(&TTL, &attr, 0, fh, 0);
+                        reply.created(&TTL, &attr, 0, FileHandle(fh), 0);
                     }
                     Err(e) => {
                         self.fh_allocator.free(fh);
@@ -994,17 +952,17 @@ impl Filesystem for VirtualFileSystem {
     }
 
     fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
         debug!("mkdir: parent={}, name={:?}", parent, name);
 
-        let path = match self.build_path(parent, name) {
+        let path = match self.build_path(parent.0, name) {
             Some(p) => p,
             None => {
                 reply.error(EINVAL);
@@ -1018,7 +976,7 @@ impl Filesystem for VirtualFileSystem {
         let (tx, rx) = oneshot::channel();
 
         self.handle.spawn(async move {
-            let result = client.create_directory(&path_clone).await;
+            let result = client.create_directory(&path_clone, Some(true)).await;
             let _ = tx.send(result);
         });
 
@@ -1044,10 +1002,16 @@ impl Filesystem for VirtualFileSystem {
         }
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        reply: ReplyEmpty,
+    ) {
         debug!("unlink: parent={}, name={:?}", parent, name);
 
-        let path = match self.build_path(parent, name) {
+        let path = match self.build_path(parent.0, name) {
             Some(p) => p,
             None => {
                 reply.error(ENOENT);
@@ -1135,13 +1099,13 @@ impl Filesystem for VirtualFileSystem {
     }
 
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         debug!(
@@ -1149,7 +1113,7 @@ impl Filesystem for VirtualFileSystem {
             parent, name, newparent, newname
         );
 
-        let old_path = match self.build_path(parent, name) {
+        let old_path = match self.build_path(parent.0, name) {
             Some(p) => p,
             None => {
                 reply.error(ENOENT);
@@ -1157,7 +1121,7 @@ impl Filesystem for VirtualFileSystem {
             }
         };
 
-        let new_path = match self.build_path(newparent, newname) {
+        let new_path = match self.build_path(newparent.0, newname) {
             Some(p) => p,
             None => {
                 reply.error(EINVAL);
@@ -1198,7 +1162,7 @@ impl Filesystem for VirtualFileSystem {
         }
     }
 
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         debug!("statfs");
 
         let label = self.drive.read().clone();
@@ -1238,7 +1202,13 @@ impl Filesystem for VirtualFileSystem {
         }
     }
 
-    fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
+    fn access(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mask: AccessFlags,
+        reply: ReplyEmpty,
+    ) {
         debug!("access: ino={}, mask={:#x}", ino, mask);
 
 
@@ -1253,31 +1223,36 @@ pub async fn mount(
     client: Arc<VaultDriveClient>,
     mount_point: &str,
     drive: &str,
-    scope: Arc<RwLock<String>>
+    scope: Arc<RwLock<String>>,
+    compression: Arc<AtomicBool>
 ) -> Result<()> {
     info!("Mounting VaultDrive at {}", mount_point);
 
     let mount_point = normalize_mount_point(mount_point)?;
     let handle = Handle::current();
-    let fs = VirtualFileSystem::new(client.clone(), handle, drive);
+    let fs = VirtualFileSystem::new(client.clone(), handle, drive,scope.clone(), compression.clone());
 
     let options = vec![
         MountOption::FSName("vaultdrive".to_string()),
         MountOption::AutoUnmount,
-        MountOption::AllowOther,
+        MountOption::Async,
         MountOption::DefaultPermissions,
     ];
 
-    info!("Starting FUSE session...");
 
-    let session = fuser::spawn_mount2(fs, &mount_point, &options)
+
+    info!("Starting FUSE session...");
+    let mut config = fuser::Config::default();
+    config.mount_options = options;
+
+
+    let session = fuser::spawn_mount2(fs, &mount_point, &config)
         .context("Failed to mount filesystem")?;
 
     client.mounts.insert(
         mount_point.clone(),
-        (Arc::new(Mutex::new(session)), drive.to_string(), scope),
+        (Arc::new(Mutex::new(session)), drive.to_string(), scope, compression),
     );
-    client.mount_points.insert(mount_point.clone());
 
     info!("Filesystem mounted successfully at {}", mount_point);
 

@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::debug;
 use winfsp::host::FileSystemHost;
-use quinn::Connection;
+use quinn::{Connection, RecvStream, SendStream};
 use crate::auth::{authenticate, reauthenticate, session};
 use crate::autoRun::{connection, remove_connection};
 use crate::commands::connection_hub;
@@ -370,21 +370,23 @@ impl VaultDriveClient {
 
 
 
-    async fn execute_request(&self, request: Request) -> Result<Response> {
-        let (server_addr_guard, session_guard) = join!(
+    async fn execute_request(&self, request: Request, stream: Option<(SendStream, RecvStream)>) -> Result<Response> {
+
+
+        let (mut send, mut recv) = if let Some((send, recv)) = stream {
+            (send, recv)
+        } else {
+            let (server_addr_guard, session_guard) = join!(
     self.server_addr.read(),
     self.session.read()
 );
 
-        let server_addr = *server_addr_guard;
-        let username = session_guard.as_ref().unwrap().authenticate_request.user_id.clone();
-        drop(session_guard);
-        drop(server_addr_guard);
-
-
-
-        let (mut send, mut recv) = self.quic.open_bi(server_addr, username).await?;
-
+            let server_addr = *server_addr_guard;
+            let username = session_guard.as_ref().unwrap().authenticate_request.user_id.clone();
+            drop(session_guard);
+            drop(server_addr_guard);
+            self.quic.open_bi(server_addr, username).await?
+        };
 
 
         write_message(&mut send, &request).await?;
@@ -407,7 +409,7 @@ impl VaultDriveClient {
                 flags,
             })),
         };
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(operationSuccess)) => Ok(operationSuccess),
             _ => bail!("Unexpected response type for delete file"),
@@ -422,7 +424,7 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
 
         match response.response_type {
             Some(response::ResponseType::DirectoryListing(listing)) => {
@@ -439,7 +441,7 @@ impl VaultDriveClient {
                 include_file_info,
             })),
         };
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(success)) => Ok(success),
             _ => bail!("Unexpected response type for delete file"),
@@ -456,7 +458,7 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
 
         match response.response_type {
             Some(response::ResponseType::FileInfo(info)) =>{
@@ -481,7 +483,7 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
 
         match response.response_type {
             Some(response::ResponseType::FileData(data)) => {
@@ -505,7 +507,7 @@ impl VaultDriveClient {
                 include_file_info,
             })),
         };
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
 
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(success)) => Ok(success),
@@ -524,7 +526,7 @@ impl VaultDriveClient {
                 include_file_info,
             })),
         };
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
 
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(success)) => {
@@ -533,6 +535,7 @@ impl VaultDriveClient {
             _ => bail!("Unexpected response type for override file"),
         }
     }
+
 
 
 
@@ -547,7 +550,8 @@ impl VaultDriveClient {
         flags: u32,
         compress: Arc<AtomicBool>,
         is_compressed: bool,
-        include_file_info: Option<bool>
+        include_file_info: Option<bool>,
+        stream: Option<(SendStream, RecvStream)>,
     ) -> Result<WriteSuccessResponse> {
         let (data, compressed) = if compress.load(Ordering::Relaxed)
             && !is_compressed
@@ -574,7 +578,7 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, stream).await?;
 
         match response.response_type {
             Some(response::ResponseType::WriteSuccess(success)) => {
@@ -589,7 +593,7 @@ impl VaultDriveClient {
                 file_handler,
             }))
         };
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(_)) => Ok(()),
             _ => bail!("Unexpected response type for delete file"),
@@ -604,7 +608,7 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
 
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(_)) => Ok(()),
@@ -622,7 +626,7 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
 
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(_)) => Ok(()),
@@ -640,7 +644,7 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
 
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(success)) => Ok(success),
@@ -655,7 +659,7 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
 
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(_)) => Ok(()),
@@ -668,7 +672,7 @@ impl VaultDriveClient {
             request_type: Some(request::RequestType::ListVolumes(ListVolumesRequest {})),
         };
 
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
 
         match response.response_type {
             Some(response::ResponseType::VolumeList(list)) => Ok(list.volumes),
@@ -684,7 +688,7 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request).await?;
+        let response = self.execute_request(request, None).await?;
 
         match response.response_type {
             Some(response::ResponseType::VolumeInfo(info)) => Ok(info.volume.unwrap()),
@@ -719,7 +723,7 @@ impl VaultDriveClient {
         self.mounts.clear();
 
 
-        self.execute_request(request).await?;
+        self.execute_request(request, None).await?;
 
         let server_addr = *server_addr_guard;
         let username = session_guard.as_ref().unwrap().authenticate_request.user_id.clone();

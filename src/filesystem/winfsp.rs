@@ -23,16 +23,17 @@ use futures::{FutureExt, SinkExt};
 use log::debug;
 use path_slash::PathExt;
 use strum_macros::Display;
+use tokio::join;
 use tokio::runtime::{Handle};
 use tokio::sync::oneshot::error::RecvError;
 use tokio::task::JoinSet;
 use tracing::{info, warn, Instrument};
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{LocalFree, HLOCAL, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_NOT_A_DIRECTORY, STATUS_INTERNAL_ERROR, STATUS_UNSUCCESSFUL, STATUS_IO_DEVICE_ERROR, STATUS_INVALID_DEVICE_REQUEST};
+use windows::Win32::Foundation::{LocalFree, HLOCAL, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_NOT_A_DIRECTORY, STATUS_INTERNAL_ERROR, STATUS_UNSUCCESSFUL, STATUS_IO_DEVICE_ERROR, STATUS_INVALID_DEVICE_REQUEST, STATUS_PENDING};
 use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT};
 
 use windows::Win32::Security::{InitializeSecurityDescriptor, SetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR};
-use windows::Win32::Storage::FileSystem::{GetLogicalDrives, FILE_APPEND_DATA, FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA};
+use windows::Win32::Storage::FileSystem::{GetLogicalDrives, FILE_APPEND_DATA, FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA};
 use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use crate::client::VaultDriveClient;
 use crate::proto::vaultdrive::{DirectoryEntry, FileInfoResponse, WriteSuccessResponse};
@@ -455,7 +456,7 @@ impl FileSystemContext for VirtualFileSystem {
         }
 
 
-        if share_access == 0 {
+        if share_access == FILE_SHARE_NONE.0 {
             flags |= EXCLUSIVE_LOCK;
         } else {
             flags |= SHARE_LOCK;
@@ -623,7 +624,7 @@ fn close(&self, context: Self::FileContext) {
             flags |= DSYNC;
         }
 
-        if share_access == 0 {
+        if share_access == FILE_SHARE_NONE.0 {
             flags |= EXCLUSIVE_LOCK;
         } else {
             flags |= SHARE_LOCK;
@@ -1105,6 +1106,8 @@ impl AsyncFileSystemContext for VirtualFileSystem {
             .ok_or(FspError::from(NTSTATUS(STATUS_INVALID_HANDLE)))
             .map(|r| r.clone());
 
+        const CHUNK_SIZE: usize = 256 * 1024; // 256KB
+
         async move {
             debug!("starting reading of offset {}", offset);
             let open_ctx = open_ctx_result?;
@@ -1114,18 +1117,56 @@ impl AsyncFileSystemContext for VirtualFileSystem {
                 return Err(FspError::from(NTSTATUS(STATUS_FILE_IS_A_DIRECTORY)));
             }
 
+            let total_len = buffer.len();
 
-            let data = self.client
-                .read_file(&open_ctx.path, offset, buffer.len() as u32, *context, self.compress.clone())
-                .await
-                .map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))?;
+            if total_len <= CHUNK_SIZE {
+                // Small read — no need to split
+                let data = self.client
+                    .read_file(&open_ctx.path, offset, total_len as u32, *context, self.compress.clone())
+                    .await
+                    .map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))?;
 
-            let bytes_read = data.len().min(buffer.len());
-            buffer[..bytes_read].copy_from_slice(&data[..bytes_read]);
+                let bytes_read = data.len().min(total_len);
+                buffer[..bytes_read].copy_from_slice(&data[..bytes_read]);
+
+                debug!("ending reading of offset {}", offset);
+                return Ok(bytes_read as u32);
+            }
+
+            let mut futures = Vec::new();
+            let mut chunk_offset = 0usize;
+
+            while chunk_offset < total_len {
+                let chunk_len = CHUNK_SIZE.min(total_len - chunk_offset);
+                let file_offset = offset + chunk_offset as u64;
+                let path = open_ctx.path.clone();
+                let client = self.client.clone();
+                let compress = self.compress.clone();
+                let ctx = *context;
+
+                futures.push(async move {
+                    let data = client
+                        .read_file(&path, file_offset, chunk_len as u32, ctx, compress)
+                        .await
+                        .map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))?;
+                    Ok::<(usize, Vec<u8>), FspError>((chunk_offset, data))
+                });
+
+                chunk_offset += chunk_len;
+            }
+
+            let results = futures::future::join_all(futures).await;
+
+            let mut total_bytes_read = 0u32;
+            for result in results {
+                let (chunk_off, data) = result?;
+                let bytes_to_copy = data.len().min(total_len - chunk_off);
+                buffer[chunk_off..chunk_off + bytes_to_copy].copy_from_slice(&data[..bytes_to_copy]);
+                total_bytes_read += bytes_to_copy as u32;
+            }
 
             debug!("ending reading of offset {}", offset);
-
-            Ok(bytes_read as u32)
+            Ok(total_bytes_read)
         }
     }
 
@@ -1144,6 +1185,17 @@ impl AsyncFileSystemContext for VirtualFileSystem {
             }
 
             if open_ctx.flags != SYNC && open_ctx.flags != DSYNC {
+                let (server_addr_guard, session_guard) = join!(
+    self.client.server_addr.read(),
+    self.client.session.read()
+);
+
+                let server_addr = *server_addr_guard;
+                let username = session_guard.as_ref().unwrap().authenticate_request.user_id.clone();
+                drop(session_guard);
+                drop(server_addr_guard);
+                let stream = self.client.quic.open_bi(server_addr, username).await
+                    .map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))?;
                 let client = self.client.clone();
                 let path = open_ctx.path.clone();
                 let compress = self.compress.clone();
@@ -1158,7 +1210,7 @@ impl AsyncFileSystemContext for VirtualFileSystem {
                     .spawn({
                         let buffer = buffer.to_vec();
                         async move{
-                            client.write_file(&path, offset, &buffer, context.clone(), flags, compress, is_compressed, Some(false))
+                            client.write_file(&path, offset, &buffer, context.clone(), flags, compress, is_compressed, Some(false), Some(stream))
                                 .await
                         }
                     });
@@ -1166,7 +1218,7 @@ impl AsyncFileSystemContext for VirtualFileSystem {
                 return Ok(buffer.len() as u32);
             }
 
-            let written = self.client.write_file(&open_ctx.path, offset, buffer, context.clone(),open_ctx.flags, self.compress.clone(), open_ctx.is_compressed, Some(true))
+            let written = self.client.write_file(&open_ctx.path, offset, buffer, context.clone(),open_ctx.flags, self.compress.clone(), open_ctx.is_compressed, Some(true), None)
                 .await
                 .map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))?;
 

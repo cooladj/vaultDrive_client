@@ -29,7 +29,7 @@ pub async fn mount(
 
     #[cfg(unix)]
     {
-        let mount = fuse::mount(client.clone(), mount_point, drive, scope).await?;
+        let mount = fuse::mount(client.clone(), mount_point, drive, scope, compress).await?;
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -77,7 +77,7 @@ pub const UNLOCK_LOCK: u32 = 1 << 9;
 pub const DELETE: u32 = 1 << 10;
 pub const DELETE_CHILDREN: u32 = 1 << 11;
 pub const TRANSVERSE: u32 = 1 << 12;
-
+///Window -> Window
 pub const WINDOW_SHARE_READ: u32 = 1 << 13;
 pub const WINDOW_SHARE_WRITE: u32 = 1 << 14;
 pub const WINDOW_SHARE_DELETE: u32 = 1 << 15;
