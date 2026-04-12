@@ -1,5 +1,3 @@
-
-
 #![cfg(unix)]
 
 use anyhow::{Result, Context};
@@ -11,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use fuser::{FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, INodeNo, KernelConfig, Generation, FileHandle, OpenFlags, FopenFlags, LockOwner, WriteFlags, RenameFlags, AccessFlags};
+use fuser::{FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, INodeNo, KernelConfig, Generation, FileHandle, OpenFlags, FopenFlags, LockOwner, WriteFlags, RenameFlags, AccessFlags, Errno};
 use libc::{chown, EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
@@ -66,6 +64,8 @@ struct FileNode {
     last_write_time: SystemTime,
     /// Permission flags from server
     flags: u32,
+
+    is_compress: bool
 }
 
 impl FileNode {
@@ -84,6 +84,7 @@ impl FileNode {
             last_access_time: accessed_time,
             last_write_time: modified_time,
             flags: info.flags,
+            is_compress: info.is_compressed
         }
     }
 
@@ -106,6 +107,7 @@ impl FileNode {
             last_access_time: modified_time,
             last_write_time: modified_time,
             flags: 0,
+            is_compress: false
         }
     }
 
@@ -180,6 +182,7 @@ struct OpenFileContext {
     flags: u32,
     /// File handle ID (for server communication)
     fh: u64,
+    is_compressed: bool,
 }
 
 /// Pending request for deduplication
@@ -197,6 +200,7 @@ pub struct VirtualFileSystem {
     inode_allocator: Arc<InodeAllocator>,
     path_to_inode: Arc<DashMap<String, u64>>,
     inode_to_node: Arc<DashMap<u64, FileNode>>,
+    inode_to_generation: Arc<DashMap<u64, u64>>,
 
     /// File handle allocator
     fh_allocator: Arc<InodeAllocator>,
@@ -204,7 +208,7 @@ pub struct VirtualFileSystem {
 
     pending_file_requests: Arc<DashMap<String, Arc<PendingRequest>>>,
     pending_dir_requests: Arc<DashMap<String, Arc<OnceCell<Vec<DirectoryEntry>>>>>,
-    
+
     lookup_counts: Arc<DashMap<u64, u64>>,
 
 
@@ -228,6 +232,7 @@ impl VirtualFileSystem {
             inode_allocator: Arc::new(InodeAllocator::new(INodeNo::ROOT.0 + 1)),
             path_to_inode: Arc::new(DashMap::new()),
             inode_to_node: Arc::new(DashMap::new()),
+            inode_to_generation: Arc::new(DashMap::new()),
             fh_allocator: Arc::new(InodeAllocator::new(1)),
             open_files: Arc::new(DashMap::new()),
             pending_file_requests: Arc::new(DashMap::new()),
@@ -250,8 +255,18 @@ impl VirtualFileSystem {
         }
 
         let ino = self.inode_allocator.allocate();
+        // If this inode was recycled from the free list, bump its generation;
+        // otherwise start at 0
+        self.inode_to_generation
+            .entry(ino)
+            .and_modify(|g| *g += 1)
+            .or_insert(0);
         self.path_to_inode.insert(path.to_string(), ino);
         ino
+    }
+
+    fn generation(&self, ino: u64) -> u64 {
+        self.inode_to_generation.get(&ino).map(|g| *g).unwrap_or(0)
     }
 
     fn get_inode(&self, path: &str) -> Option<u64> {
@@ -456,7 +471,7 @@ impl Filesystem for VirtualFileSystem {
         let path = match self.build_path(parent.0, name) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -469,15 +484,15 @@ impl Filesystem for VirtualFileSystem {
                     .or_insert(1);
 
                 let attr = node.to_file_attr(self.uid, self.gid);
-                reply.entry(&TTL, &attr, Generation);
+                reply.entry(&TTL, &attr, Generation(self.generation(node.ino)));
             }
             Err(e) => {
-                reply.error(e);
+                reply.error(Errno::from_i32(e));
             }
         }
     }
 
-        fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         debug!("getattr: ino={}", ino);
 
         // Handle root inode specially
@@ -514,10 +529,10 @@ impl Filesystem for VirtualFileSystem {
         }
 
         // Get path for inode
-        let path = match self.get_path(ino) {
+        let path = match self.get_path(ino.0) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -528,7 +543,7 @@ impl Filesystem for VirtualFileSystem {
                 reply.attr(&TTL, &attr);
             }
             Err(e) => {
-                reply.error(e);
+                reply.error(Errno::from_i32(e));
             }
         }
     }
@@ -541,10 +556,12 @@ impl Filesystem for VirtualFileSystem {
         let path = match self.get_path(_ino.0) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
+
+        let ino = _ino.0;
 
         let internal_flags = self.convert_open_flags(_flags.0);
         let fh = self.fh_allocator.allocate();
@@ -567,19 +584,20 @@ impl Filesystem for VirtualFileSystem {
                     is_directory: false,
                     flags: internal_flags,
                     fh,
+                    is_compressed:false
                 };
                 self.open_files.insert(fh, ctx);
 
-                reply.opened(FileHandle(fh), FopenFlags());
+                reply.opened(FileHandle(fh), FopenFlags::empty());
             }
             Ok(Err(e)) => {
                 error!("open: failed to open file: {:?}", e);
                 self.fh_allocator.free(fh);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
             Err(_) => {
                 self.fh_allocator.free(fh);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
@@ -600,18 +618,19 @@ impl Filesystem for VirtualFileSystem {
         let ctx = match self.open_files.get(&fh.0) {
             Some(c) => c.clone(),
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
 
         let client = self.client.clone();
+        let compress = self.compress.clone();
 
         let (tx, rx) = oneshot::channel();
 
         self.handle.spawn(async move {
             let result = client
-                .read_file(&ctx.path, offset as u64, size, fh.0, self.compress)
+                .read_file(&ctx.path, offset as u64, size, fh.0, compress)
                 .await;
             let _ = tx.send(result);
         });
@@ -622,10 +641,10 @@ impl Filesystem for VirtualFileSystem {
             }
             Ok(Err(e)) => {
                 error!("read: failed: {:?}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
             Err(_) => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
@@ -653,19 +672,20 @@ impl Filesystem for VirtualFileSystem {
         let ctx = match self.open_files.get(&fh.0) {
             Some(c) => c.clone(),
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
 
         let client = self.client.clone();
         let flags = ctx.flags;
+        let compress = self.compress.clone();
 
         let (tx, rx) = oneshot::channel();
 
         self.handle.spawn(async move {
             let result = client
-                .write_file(&ctx.path, offset as u64, data, fh.0, flags, None)
+                .write_file(&ctx.path, offset as u64, data, fh.0, flags, compress, ctx.is_compressed, None, None)
                 .await;
             let _ = tx.send(result);
         });
@@ -676,10 +696,10 @@ impl Filesystem for VirtualFileSystem {
             }
             Ok(Err(e)) => {
                 error!("write: failed: {:?}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
             Err(_) => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
@@ -737,13 +757,13 @@ impl Filesystem for VirtualFileSystem {
     fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         debug!("opendir: ino={}", _ino.0);
 
-        let path = if ino == INodeNo::ROOT.0 {
+        let path = if _ino == INodeNo::ROOT {
             "/".to_string()
         } else {
             match self.get_path(_ino.0) {
                 Some(p) => p,
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -751,15 +771,16 @@ impl Filesystem for VirtualFileSystem {
 
         let fh = self.fh_allocator.allocate();
         let ctx = OpenFileContext {
-            ino,
+            ino: _ino.0,
             path,
             is_directory: true,
             flags: READ,
             fh,
+            is_compressed: false
         };
         self.open_files.insert(fh, ctx);
 
-        reply.opened(FileHandle(fh), 0);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn readdir(
@@ -768,27 +789,27 @@ impl Filesystem for VirtualFileSystem {
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
-        reply: ReplyDirectory,
-    ){
+        mut reply: ReplyDirectory,
+    ) {
         debug!("readdir: ino={}, fh={}, offset={}", ino, fh, offset);
 
         let ctx = match self.open_files.get(&fh.0) {
             Some(c) => c.clone(),
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
 
         if !ctx.is_directory {
-            reply.error(ENOTDIR);
+            reply.error(Errno::ENOTDIR);
             return;
         }
 
         let entries = match self.get_or_fetch_directory_list_blocking(&ctx.path) {
             Ok(e) => e,
             Err(e) => {
-                reply.error(e);
+                reply.error(Errno::from_i32(e));
                 return;
             }
         };
@@ -898,7 +919,7 @@ impl Filesystem for VirtualFileSystem {
         let path = match self.build_path(parent.0, name) {
             Some(p) => p,
             None => {
-                reply.error(EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
@@ -912,43 +933,50 @@ impl Filesystem for VirtualFileSystem {
         let (tx, rx) = oneshot::channel();
 
         self.handle.spawn(async move {
-            let result = client.create_file(&path_clone, 0, fh).await;
+            let result = client.create_file(&path_clone, 0, fh, Some(true)).await;
             let _ = tx.send(result);
         });
 
         match rx.blocking_recv() {
-            Ok(Ok(_)) => {
-                // Fetch the created file's info
-                match self.get_or_fetch_file_info_blocking(&path) {
-                    Ok(node) => {
-                        let ctx = OpenFileContext {
-                            ino: node.ino,
-                            path: path.clone(),
-                            is_directory: false,
-                            flags: internal_flags,
-                            fh,
-                        };
-                        self.open_files.insert(fh, ctx);
+            Ok(Ok(succes)) => {
+                let node = if let Some(info) = succes.file_info{
+                    let ino = self.get_or_create_inode(&path_clone);
 
-                        let attr = node.to_file_attr(self.uid, self.gid);
-                        reply.created(&TTL, &attr, 0, FileHandle(fh), 0);
+                    FileNode::from_file_info(info, ino)
+                }else {
+                    match self.get_or_fetch_file_info_blocking(&path) {
+                        Ok(node) => node,
+                        Err(e) => {
+                            self.fh_allocator.free(fh);
+                            reply.error(Errno::from_i32(e));
+                            return;
+                        }
                     }
-                    Err(e) => {
-                        self.fh_allocator.free(fh);
-                        reply.error(e);
-                    }
-                }
+                };
+
+                let ctx = OpenFileContext {
+                    ino: node.ino,
+                    path: path.clone(),
+                    is_directory: false,
+                    flags: internal_flags,
+                    fh,
+                    is_compressed: node.is_compress
+                };
+                self.open_files.insert(fh, ctx);
+
+                let attr = node.to_file_attr(self.uid, self.gid);
+                reply.created(&TTL, &attr, Generation(self.generation(node.ino)), FileHandle(fh), FopenFlags::empty());
             }
             Ok(Err(e)) => {
                 error!("create: failed to create file: {:?}", e);
                 self.fh_allocator.free(fh);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
             Err(_) => {
                 self.fh_allocator.free(fh);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
-        }
+        };
     }
 
     fn mkdir(
@@ -965,7 +993,7 @@ impl Filesystem for VirtualFileSystem {
         let path = match self.build_path(parent.0, name) {
             Some(p) => p,
             None => {
-                reply.error(EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
@@ -985,19 +1013,19 @@ impl Filesystem for VirtualFileSystem {
                 match self.get_or_fetch_file_info_blocking(&path) {
                     Ok(node) => {
                         let attr = node.to_file_attr(self.uid, self.gid);
-                        reply.entry(&TTL, &attr, 0);
+                        reply.entry(&TTL, &attr, Generation(self.generation(node.ino)));
                     }
                     Err(e) => {
-                        reply.error(e);
+                        reply.error(Errno::from_i32(e));
                     }
                 }
             }
             Ok(Err(e)) => {
                 error!("mkdir: failed: {:?}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
             Err(_) => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
@@ -1014,7 +1042,7 @@ impl Filesystem for VirtualFileSystem {
         let path = match self.build_path(parent.0, name) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -1039,21 +1067,21 @@ impl Filesystem for VirtualFileSystem {
             }
             Ok(Err(e)) => {
                 error!("unlink: failed: {:?}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
             Err(_) => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         debug!("rmdir: parent={}, name={:?}", parent, name);
 
-        let path = match self.build_path(parent, name) {
+        let path = match self.build_path(parent.0, name) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -1061,12 +1089,12 @@ impl Filesystem for VirtualFileSystem {
         match self.get_or_fetch_directory_list_blocking(&path) {
             Ok(entries) => {
                 if !entries.is_empty() {
-                    reply.error(ENOTEMPTY);
+                    reply.error(Errno::ENOTEMPTY);
                     return;
                 }
             }
             Err(e) => {
-                reply.error(e);
+                reply.error(Errno::from_i32(e));
                 return;
             }
         }
@@ -1090,10 +1118,10 @@ impl Filesystem for VirtualFileSystem {
             }
             Ok(Err(e)) => {
                 error!("rmdir: failed: {:?}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
             Err(_) => {
-                reply.error(EIO);
+                reply.error( Errno::EIO);
             }
         }
     }
@@ -1116,7 +1144,7 @@ impl Filesystem for VirtualFileSystem {
         let old_path = match self.build_path(parent.0, name) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -1124,7 +1152,7 @@ impl Filesystem for VirtualFileSystem {
         let new_path = match self.build_path(newparent.0, newname) {
             Some(p) => p,
             None => {
-                reply.error(EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
@@ -1154,10 +1182,10 @@ impl Filesystem for VirtualFileSystem {
             }
             Ok(Err(e)) => {
                 error!("rename: failed: {:?}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
             Err(_) => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
@@ -1181,14 +1209,14 @@ impl Filesystem for VirtualFileSystem {
                 let bfree = info.available_space / BLOCK_SIZE;
 
                 reply.statfs(
-                    blocks,        
-                    bfree,         
-                    bfree,         
-                    0,          
-                    0,             
-                    BLOCK_SIZE as u32, 
-                    255,           
-                    BLOCK_SIZE as u32, 
+                    blocks,
+                    bfree,
+                    bfree,
+                    0,
+                    0,
+                    BLOCK_SIZE as u32,
+                    255,
+                    BLOCK_SIZE as u32,
                 );
             }
             Ok(Err(e)) => {

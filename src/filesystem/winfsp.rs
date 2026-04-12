@@ -1410,6 +1410,7 @@ pub async fn mount(client: Arc<VaultDriveClient>, mount_point: &mut String, driv
         .context("Failed to create filesystem host")?;
 
 
+
     tracing::info!("Mounting filesystem at {}", mount_point);
 
     host.mount(&mount_point).context("Failed to mount filesystem")?;

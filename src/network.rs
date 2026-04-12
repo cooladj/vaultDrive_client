@@ -80,6 +80,8 @@ impl QuicClient {
         ));
 
         let mut transport = TransportConfig::default();
+        transport.send_fairness(false);
+
         transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
         client_config.transport_config(Arc::new(transport));
 
