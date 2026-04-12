@@ -91,9 +91,8 @@ async fn main() -> Result<()> {
             let mut sigint = signal(SignalKind::interrupt())?;
 
             // Start your server
-            let server_handle = tokio::spawn(async move {
-                if let Err(e) = deamonize::run_daemon_server().await?
-                {
+            tokio::spawn(async move {
+                if let Err(e) = deamonize::run_daemon_server().await {
                     tracing::error!(" failed to start server {}", e);
                 }
             });

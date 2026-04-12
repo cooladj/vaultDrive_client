@@ -3,6 +3,7 @@
 use anyhow::{Result, Context};
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -432,7 +433,8 @@ impl VirtualFileSystem {
 
 
 impl Filesystem for VirtualFileSystem {
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig)  -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
+
         info!("FUSE filesystem initialized");
         Ok(())
     }
@@ -680,6 +682,11 @@ impl Filesystem for VirtualFileSystem {
         let client = self.client.clone();
         let flags = ctx.flags;
         let compress = self.compress.clone();
+        // SAFETY: The async task is driven to completion synchronously via
+        // blocking_recv() before this method returns, so `data` is guaranteed
+        // to remain valid for the entire duration of the task. The 'static
+        // lifetime is a lie to the compiler that is upheld by the blocking contract.
+        let data: &'static [u8] = unsafe { std::mem::transmute(data) };
 
         let (tx, rx) = oneshot::channel();
 
@@ -705,11 +712,11 @@ impl Filesystem for VirtualFileSystem {
     }
 
     fn flush(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
-        _lock_owner: u64,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
         debug!("flush: ino={}, fh={}", ino, fh);
@@ -940,7 +947,7 @@ impl Filesystem for VirtualFileSystem {
         match rx.blocking_recv() {
             Ok(Ok(succes)) => {
                 let node = if let Some(info) = succes.file_info{
-                    let ino = self.get_or_create_inode(&path_clone);
+                    let ino = self.get_or_create_inode(&path);
 
                     FileNode::from_file_info(info, ino)
                 }else {

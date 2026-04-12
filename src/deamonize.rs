@@ -19,7 +19,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use service_manager::*;
 use tokio_rustls::TlsAcceptor;
+#[cfg(windows)]
 use windows::Win32::Security::PSID;
+#[cfg(windows)]
 use windows::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use crate::autoRun::{init_db, get_connections_with_mounts};
 use crate::client::VaultDriveClient;

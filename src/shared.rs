@@ -1,6 +1,4 @@
 ﻿
-use egui::Memory;
-
 pub fn elevated() -> bool {
     #[cfg(windows)]
     {

@@ -145,7 +145,6 @@ pub async fn execute_socket_command(command: SocketCommand) -> CommandResponse {
 }
 
 
-#[cfg(windows)]
 const TIMEOUT_SECS: u64 = 5;
 
 pub async fn send_command_to_daemon(command: SocketCommand) -> Result<CommandResponse> {

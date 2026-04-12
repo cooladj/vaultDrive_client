@@ -13,13 +13,16 @@ use tokio::join;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::debug;
+#[cfg(windows)]
 use winfsp::host::FileSystemHost;
+#[cfg(windows)]
+use crate::filesystem::winfsp::{VirtualFileSystem};
+
 use quinn::{Connection, RecvStream, SendStream};
 use crate::auth::{authenticate, reauthenticate, session};
 use crate::autoRun::{connection, remove_connection};
 use crate::commands::connection_hub;
 use crate::driveManagerUI::{ConnectionType};
-use crate::filesystem::winfsp::{VirtualFileSystem};
 use crate::network::{QuicClient, read_message, write_message, ZERO_ADDR};
 use crate::proto::hub;
 use crate::proto::hub::hub_request::RequestType;
