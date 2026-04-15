@@ -11,6 +11,8 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt, TryFutureExt};
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName, };
 use interprocess::local_socket::traits::tokio::{Listener, };
+#[cfg(unix)]
+use interprocess::os::unix::local_socket::ListenerOptionsExt;
 use log::{debug, info, warn};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -248,11 +250,27 @@ pub(crate) async fn run_daemon_server() -> anyhow::Result<()> {
 
     let name = path_str.to_fs_name::<GenericFilePath>()?;
 
-    let listener = ListenerOptions::new()
+    let mut listener_options = ListenerOptions::new()
         .name(name)
         .reclaim_name(true)
-        .try_overwrite(true)
-        .create_tokio()?;
+        .try_overwrite(true);
+
+    #[cfg(unix)]
+        let old_umask = unsafe { libc::umask(0o000) };
+
+
+    #[cfg(unix)]{
+        listener_options = listener_options.mode(0o666);
+    }
+
+
+    let listener = listener_options.create_tokio()?;
+
+    #[cfg(unix)]
+    unsafe { libc::umask(old_umask); }
+
+
+
 
     info!("Daemon listening on {}", path_str);
 
