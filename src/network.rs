@@ -16,7 +16,7 @@ use prost::Message;
 
 use rcgen::{ CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::{DigitallySignedStruct, RootCertStore};
-use tokio::io::{join, AsyncWriteExt};
+use tokio::io::{join, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
 use once_cell::sync::Lazy;
 use quinn::udp::{RecvMeta, Transmit};
@@ -430,9 +430,8 @@ impl ServerCertVerifier for AcceptAllVerifier {
 
 
 pub async fn write_message<T: Message>(send: &mut SendStream, msg: &T) -> Result<()> {
-    let mut buf = BytesMut::new();
-    msg.encode(&mut buf).context("Failed to encode message")?;
-
+    let buf = msg.encode_to_vec();
+    
     send.write_u32(buf.len() as u32).await.context("Failed to write length")?;
     send.write_all(&buf).await.context("Failed to write message")?;
     send.flush().await.context("Failed to flush message")?;
@@ -442,15 +441,13 @@ pub async fn write_message<T: Message>(send: &mut SendStream, msg: &T) -> Result
 }
 
 pub async fn read_message<T: Message + Default>(recv: &mut RecvStream) -> Result<T> {
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await
-        .context("Failed to read message length")?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
+    let len = recv.read_u32().await
+        .context("Failed to read message length")? as usize;
 
     let mut msg_buf = vec![0u8; len];
     recv.read_exact(&mut msg_buf).await
         .context("Failed to read message body")?;
+    
 
     T::decode(&msg_buf[..])
         .context("Failed to decode message")

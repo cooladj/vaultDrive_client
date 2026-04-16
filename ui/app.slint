@@ -1,0 +1,953 @@
+// ── Theme ──────────────────────────────────────────────────────────────────
+
+global Theme {
+    // Backgrounds
+    out property <color> bg-primary:       #f8f9fb;
+    out property <color> bg-card:          #ffffff;
+    out property <color> bg-card-mounted:  #f7fcf9;
+    out property <color> bg-input:         #f3f4f6;
+    out property <color> bg-input-active:  #ffffff;
+
+    // Text
+    out property <color> text-primary:     #111827;
+    out property <color> text-secondary:   #6b7280;
+    out property <color> text-muted:       #9ca3af;
+    out property <color> text-white:       #ffffff;
+
+    // Accent / Buttons
+    out property <color> accent:           #18181b;
+    out property <color> accent-light:     #3f3f46;
+    out property <color> accent-subtle:    #f4f4f5;
+
+    // Status
+    out property <color> success:          #16a34a;
+    out property <color> success-light:    #dcfce7;
+    out property <color> danger:           #dc2626;
+    out property <color> danger-light:     #fee2e2;
+    out property <color> warning:          #eab308;
+
+    // Borders
+    out property <color> border:           #e5e7eb;
+    out property <color> border-light:     #f3f4f6;
+
+    // Spacing
+    out property <length> sp-xs: 4px;
+    out property <length> sp-sm: 8px;
+    out property <length> sp-md: 16px;
+    out property <length> sp-lg: 24px;
+    out property <length> sp-xl: 32px;
+
+    // Sizing
+    out property <length> card-min-h:  260px;
+    out property <length> btn-h:       36px;
+    out property <length> btn-h-sm:    32px;
+    out property <length> input-h:     34px;
+    out property <length> radius:      8px;
+    out property <length> radius-sm:   6px;
+    out property <length> radius-lg:   12px;
+    out property <length> page-pad:    28px;
+    out property <length> bar-h:       6px;
+}
+
+// ── Data Models ────────────────────────────────────────────────────────────
+
+export struct DriveInfo {
+    name:               string,
+    server-mount-point: string,
+    mount-path:         string,
+    sync-path:          string,
+    mounted:            bool,
+    used-space-gb:      int,
+    total-space-gb:     int,
+    scope:              string,
+    compress:           bool,
+}
+
+export struct ConnectionInfo {
+    ip-addr:    string,
+    username:   string,
+    host-name:  string,
+    drives:     [DriveInfo],
+}
+
+// ── Toggle Switch ──────────────────────────────────────────────────────────
+
+component ToggleSwitch {
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+
+    width: 44px;
+    height: 22px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: self.height / 2;
+        background: checked ? Theme.accent : #c8c8cd;
+        animate background { duration: 200ms; easing: ease-in-out; }
+
+        // Knob
+        Rectangle {
+            x: checked ? parent.width - self.width - 2px : 2px;
+            y: (parent.height - self.height) / 2;
+            width: parent.height - 5px;
+            height: parent.height - 5px;
+            border-radius: self.height / 2;
+            background: white;
+            animate x { duration: 200ms; easing: ease-in-out; }
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+}
+
+// ── Status Badge ───────────────────────────────────────────────────────────
+
+component StatusBadge {
+    in property <bool> mounted;
+
+    HorizontalLayout {
+        alignment: center;
+        Rectangle {
+            border-radius: Theme.radius-sm;
+            background: mounted ? Theme.success-light : Theme.accent-subtle;
+            height: 24px;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                alignment: center;
+
+                Text {
+                    text: mounted ? "Mounted" : "Unmounted";
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: mounted ? Theme.success : Theme.text-secondary;
+                }
+            }
+        }
+    }
+}
+
+// ── Storage Progress Bar ───────────────────────────────────────────────────
+
+component StorageBar {
+    in property <float> fraction;
+    in property <color> bar-color: Theme.success;
+
+    height: Theme.bar-h;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 3px;
+        background: Theme.bg-input;
+
+        Rectangle {
+            x: 0;
+            y: 0;
+            width: parent.width * clamp(fraction, 0, 1);
+            height: 100%;
+            border-radius: 3px;
+            background: bar-color;
+            animate width { duration: 400ms; easing: ease-out; }
+        }
+    }
+}
+
+// ── Styled Text Input ──────────────────────────────────────────────────────
+
+component StyledInput {
+    in-out property <string> text <=> input.text;
+    in property <string> placeholder;
+    in property <bool> is-password: false;
+    in property <bool> enabled: true;
+    in property <bool> read-only: false;
+    callback edited(string);
+
+    height: Theme.input-h;
+
+    Rectangle {
+        border-radius: Theme.radius-sm;
+        background: read-only ? Theme.bg-input : Theme.bg-input-active;
+        border-width: read-only ? 0 : 1px;
+        border-color: input.has-focus ? Theme.accent : Theme.border;
+        clip: true;
+
+        // Placeholder text
+        if root.text == "" && !input.has-focus: Text {
+            x: Theme.sp-sm;
+            text: root.placeholder;
+            font-size: 13px;
+            color: Theme.text-muted;
+            vertical-alignment: center;
+        }
+
+        input := TextInput {
+            x: Theme.sp-sm;
+            width: max(parent.width - Theme.sp-sm * 2, self.preferred-width);
+            vertical-alignment: center;
+            font-size: 13px;
+            color: Theme.text-primary;
+            input-type: is-password ? InputType.password : InputType.text;
+            enabled: root.enabled && !root.read-only;
+            single-line: true;
+
+            cursor-position-changed(cursor-pos) => {
+                if cursor-pos.x + self.x < Theme.sp-sm {
+                    self.x = -cursor-pos.x + Theme.sp-sm;
+                } else if cursor-pos.x + self.x > parent.width - Theme.sp-sm - self.text-cursor-width {
+                    self.x = parent.width - cursor-pos.x - Theme.sp-sm - self.text-cursor-width;
+                }
+            }
+
+            edited => {
+                root.edited(self.text);
+            }
+        }
+    }
+}
+
+// ── Primary Button ─────────────────────────────────────────────────────────
+
+component PrimaryButton {
+    in property <string> label;
+    in property <color> fill: Theme.accent;
+    in property <color> text-color: Theme.text-white;
+    in property <color> border-color: #00000000;
+    in property <bool> has-border: false;
+    in property <bool> enabled: true;
+    in property <length> btn-min-width: 90px;
+    in property <length> btn-height: Theme.btn-h;
+    callback clicked;
+
+    height: btn-height;
+    min-width: root.btn-min-width;
+
+    Rectangle {
+        border-radius: Theme.radius-sm;
+        background: !root.enabled ? Theme.bg-input : touch.has-hover ? root.fill.darker(0.1) : root.fill;
+        border-width: root.has-border ? 1px : 0;
+        border-color: root.border-color;
+        opacity: root.enabled ? 1.0 : 0.5;
+
+        Text {
+            text: root.label;
+            font-size: 13px;
+            font-weight: 600;
+            color: root.text-color;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        touch := TouchArea {
+            enabled: root.enabled;
+            clicked => { root.clicked(); }
+        }
+    }
+}
+
+// ── Drive Card ─────────────────────────────────────────────────────────────
+
+component DriveCard {
+    in property <DriveInfo> drive;
+    in property <int> connection-index;
+    in property <int> drive-index;
+    in property <bool> is-loading: false;
+    in property <bool> is-elevated: false;
+
+    callback mount-clicked(int, int);
+    callback scope-clicked(int, int);
+    callback compress-toggled(int, int, bool);
+    callback mount-path-changed(int, int, string);
+
+    // Derived properties
+    property <float> usage-fraction:
+        drive.total-space-gb == 0 ? 0 : drive.used-space-gb / drive.total-space-gb;
+    property <float> usage-percent: usage-fraction * 100;
+    property <bool> is-critical: usage-percent > 80;
+    property <bool> is-warning: usage-percent > 60;
+    property <color> bar-color:
+        is-critical ? Theme.danger : is-warning ? Theme.warning : Theme.success;
+
+    min-width: 280px;
+    min-height: Theme.card-min-h;
+
+    Rectangle {
+        border-radius: Theme.radius-lg;
+        background: drive.mounted ? Theme.bg-card-mounted : Theme.bg-card;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 6px;
+        drop-shadow-offset-y: 1px;
+        drop-shadow-color: #00000008;
+
+        VerticalLayout {
+            padding: Theme.sp-lg;
+            spacing: 0;
+
+            // ── Card Header ────────────────────────────────────────
+            HorizontalLayout {
+                spacing: Theme.sp-xs;
+                alignment: start;
+
+                Text {
+                    text: "💾";
+                    font-size: 18px;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: drive.name;
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+
+                StatusBadge { mounted: drive.mounted; }
+            }
+
+            Rectangle { height: Theme.sp-lg; }
+
+            // ── Mount Path ─────────────────────────────────────────
+            Text {
+                text: "Mount Path";
+                font-size: 11px;
+                font-weight: 700;
+                color: Theme.text-muted;
+            }
+
+            Rectangle { height: Theme.sp-xs; }
+
+            StyledInput {
+                text: drive.mount-path;
+                placeholder: "Enter mount path...";
+                read-only: drive.mounted;
+                edited(new-text) => {
+                    root.mount-path-changed(root.connection-index, root.drive-index, new-text);
+                }
+            }
+
+            Rectangle { height: Theme.sp-md; }
+
+            // ── Storage ────────────────────────────────────────────
+            Text {
+                text: "Storage";
+                font-size: 11px;
+                font-weight: 700;
+                color: Theme.text-muted;
+            }
+
+            Rectangle { height: Theme.sp-xs; }
+
+            HorizontalLayout {
+                alignment: start;
+
+                Text {
+                    text: "\{drive.used-space-gb} GB";
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+
+                Text {
+                    text: " / \{drive.total-space-gb} GB";
+                    font-size: 14px;
+                    color: Theme.text-secondary;
+                    horizontal-stretch: 1;
+                }
+
+                Text {
+                    text: "\{round(usage-percent)}%";
+                    font-size: 12px;
+                    color: bar-color;
+                }
+            }
+
+            Rectangle { height: Theme.sp-sm; }
+
+            StorageBar {
+                fraction: usage-fraction;
+                bar-color: root.bar-color;
+            }
+
+            Rectangle { height: Theme.sp-lg; }
+
+            // ── Action Buttons ─────────────────────────────────────
+            HorizontalLayout {
+                spacing: Theme.sp-sm;
+                alignment: start;
+
+                PrimaryButton {
+                    label: drive.mounted ? "Unmount" : "Mount";
+                    fill: drive.mounted ? Theme.accent-subtle : Theme.accent;
+                    text-color: drive.mounted ? Theme.text-primary : Theme.text-white;
+                    has-border: drive.mounted;
+                    border-color: Theme.border;
+                    btn-height: Theme.btn-h-sm;
+                    btn-min-width: 80px;
+                    enabled: !is-loading;
+                    clicked => { root.mount-clicked(root.connection-index, root.drive-index); }
+                }
+
+                if drive.mounted: PrimaryButton {
+                    label: drive.scope == "" ? "All Users" : "Current User";
+                    fill: drive.scope == "" ? Theme.success-light : Theme.accent-subtle;
+                    text-color: Theme.text-primary;
+                    has-border: true;
+                    border-color: Theme.border;
+                    btn-height: Theme.btn-h-sm;
+                    btn-min-width: 90px;
+                    enabled: !is-loading && is-elevated;
+                    clicked => { root.scope-clicked(root.connection-index, root.drive-index); }
+                }
+
+                if drive.mounted: HorizontalLayout {
+                    spacing: Theme.sp-sm;
+                    alignment: center;
+
+                    ToggleSwitch {
+                        checked: drive.compress;
+                        enabled: !is-loading;
+                        toggled(val) => {
+                            root.compress-toggled(
+                                root.connection-index,
+                                root.drive-index,
+                                val,
+                            );
+                        }
+                    }
+
+                    Text {
+                        text: "Compress";
+                        font-size: 12px;
+                        color: Theme.text-primary;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Connection Section ─────────────────────────────────────────────────────
+
+component ConnectionSection {
+    in property <ConnectionInfo> connection;
+    in property <int> connection-index;
+    in property <bool> is-elevated: false;
+    in property <string> loading-key;
+
+    callback disconnect-clicked(int);
+    callback mount-clicked(int, int);
+    callback scope-clicked(int, int);
+    callback compress-toggled(int, int, bool);
+    callback mount-path-changed(int, int, string);
+
+    VerticalLayout {
+        spacing: Theme.sp-md;
+
+        // ── Connection Header ──────────────────────────────────────
+        HorizontalLayout {
+            padding-left: Theme.page-pad;
+            padding-right: Theme.page-pad;
+            alignment: start;
+
+            // Status dot
+            Rectangle {
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: Theme.success;
+                y: (parent.height - self.height) / 2;
+            }
+
+            Rectangle { width: Theme.sp-sm; }
+
+            Text {
+                text: "\{connection.ip-addr} → \{connection.host-name} → \{connection.username}";
+                font-size: 14px;
+                font-weight: 700;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+
+            PrimaryButton {
+                label: "Disconnect";
+                fill: Theme.danger-light;
+                text-color: Theme.danger;
+                btn-height: Theme.btn-h-sm;
+                btn-min-width: 130px;
+                clicked => { root.disconnect-clicked(root.connection-index); }
+            }
+        }
+
+        // ── Drive Cards ────────────────────────────────────────────
+        Flickable {
+            viewport-width: self.width;
+            interactive: true;
+
+            HorizontalLayout {
+                padding-left: Theme.page-pad;
+                padding-right: Theme.page-pad;
+                spacing: Theme.sp-md;
+
+                for drive[di] in connection.drives: DriveCard {
+                    drive: drive;
+                    connection-index: root.connection-index;
+                    drive-index: di;
+                    is-elevated: root.is-elevated;
+                    is-loading: root.loading-key != "";
+                    width: 320px;
+
+                    mount-clicked(ci, di)          => { root.mount-clicked(ci, di); }
+                    scope-clicked(ci, di)           => { root.scope-clicked(ci, di); }
+                    compress-toggled(ci, di, val)   => { root.compress-toggled(ci, di, val); }
+                    mount-path-changed(ci, di, val) => { root.mount-path-changed(ci, di, val); }
+                }
+            }
+        }
+    }
+}
+
+// ── Connect Dialog ─────────────────────────────────────────────────────────
+
+component ConnectDialog {
+    in-out property <bool> open;
+    in property <bool> is-loading: false;
+    in property <bool> is-elevated: false;
+
+    // Form fields
+    in-out property <string> system;
+    in-out property <string> username;
+    in-out property <string> password;
+    in-out property <bool>   tofu-enabled;
+    in-out property <int>    connection-type: 0;  // 0 = Direct, 1 = Hub
+    in-out property <int>    scope-type: 0;       // 0 = CurrentUser, 1 = All
+
+    callback submitted;
+    callback cancelled;
+
+    property <bool> can-submit: !is-loading && system != "" && username != "" && password != "";
+
+    if open: Rectangle {
+        // Backdrop
+        width: 100%;
+        height: 100%;
+        background: #00000066;
+
+        // Backdrop click-to-close (covers full area behind the dialog)
+        TouchArea {
+            clicked => { root.cancelled(); }
+        }
+
+        // Dialog
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 460px;
+            height: 580px;
+            border-radius: Theme.radius-lg;
+            background: Theme.bg-card;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #00000022;
+
+            // Absorb clicks on empty dialog space so backdrop doesn't close.
+            // Declared before VerticalLayout so inputs render on top in z-order.
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => { }
+            }
+
+            VerticalLayout {
+                padding: Theme.sp-lg;
+                spacing: 0;
+
+                Text {
+                    text: "Add a network or remote drive to access files from other systems";
+                    font-size: 14px;
+                    color: Theme.text-secondary;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { height: Theme.sp-md; }
+
+                // ── Scope ──────────────────────────────────────────
+                if is-elevated: VerticalLayout {
+                    spacing: Theme.sp-xs;
+
+                    Text {
+                        text: "Scope";
+                        font-size: 12px;
+                        font-weight: 700;
+                        color: Theme.text-primary;
+                    }
+
+                    HorizontalLayout {
+                        spacing: Theme.sp-sm;
+
+                        PrimaryButton {
+                            label: "Current User";
+                            fill: scope-type == 0 ? Theme.accent : Theme.accent-subtle;
+                            text-color: scope-type == 0 ? Theme.text-white : Theme.text-primary;
+                            has-border: true;
+                            border-color: Theme.border;
+                            btn-height: Theme.btn-h-sm;
+                            clicked => { root.scope-type = 0; }
+                        }
+
+                        PrimaryButton {
+                            label: "All Users";
+                            fill: scope-type == 1 ? Theme.accent : Theme.accent-subtle;
+                            text-color: scope-type == 1 ? Theme.text-white : Theme.text-primary;
+                            border-color: Theme.border;
+                            has-border: true;
+                            btn-height: Theme.btn-h-sm;
+                            clicked => { root.scope-type = 1; }
+                        }
+                    }
+
+                    Rectangle { height: Theme.sp-md; }
+                }
+
+                // ── Connection Type ────────────────────────────────
+                Text {
+                    text: "Connection Type";
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+
+                Rectangle { height: Theme.sp-xs; }
+
+                HorizontalLayout {
+                    spacing: Theme.sp-sm;
+
+                    PrimaryButton {
+                        label: "Direct";
+                        fill: connection-type == 0 ? Theme.accent : Theme.accent-subtle;
+                        text-color: connection-type == 0 ? Theme.text-white : Theme.text-primary;
+                        border-color: Theme.border;
+                        has-border: true;
+                        btn-height: Theme.btn-h-sm;
+                        clicked => { root.connection-type = 0; }
+                    }
+
+                    PrimaryButton {
+                        label: "Hub";
+                        fill: connection-type == 1 ? Theme.accent : Theme.accent-subtle;
+                        text-color: connection-type == 1 ? Theme.text-white : Theme.text-primary;
+                        border-color: Theme.border;
+                        has-border: true;
+                        btn-height: Theme.btn-h-sm;
+                        clicked => { root.connection-type = 1; }
+                    }
+                }
+
+                Rectangle { height: Theme.sp-md; }
+
+                // ── System Address / Hostname ──────────────────────
+                Text {
+                    text: connection-type == 0 ? "System Address" : "Hostname";
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+
+                Rectangle { height: Theme.sp-xs; }
+
+                StyledInput {
+                    text <=> root.system;
+                    placeholder: connection-type == 0 ? "192.168.1.100:1234" : "my-server.local";
+                    enabled: !root.is-loading;
+                }
+
+                Rectangle { height: Theme.sp-md; }
+
+                // ── Username ───────────────────────────────────────
+                Text {
+                    text: "Username";
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+
+                Rectangle { height: Theme.sp-xs; }
+
+                StyledInput {
+                    text <=> root.username;
+                    placeholder: "Username";
+                    enabled: !root.is-loading;
+                }
+
+                Rectangle { height: Theme.sp-md; }
+
+                // ── Password ───────────────────────────────────────
+                Text {
+                    text: "Password";
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+
+                Rectangle { height: Theme.sp-xs; }
+
+                StyledInput {
+                    text <=> root.password;
+                    placeholder: "Password";
+                    is-password: true;
+                    enabled: !root.is-loading;
+                }
+
+                Rectangle { height: Theme.sp-lg; }
+
+                // ── TOFU Toggle ────────────────────────────────────
+                HorizontalLayout {
+                    spacing: Theme.sp-sm;
+                    alignment: start;
+
+                    ToggleSwitch {
+                        checked <=> root.tofu-enabled;
+                        enabled: !root.is-loading;
+                    }
+
+                    Text {
+                        text: "Trust on First Use (TOFU)";
+                        font-size: 13px;
+                        color: Theme.text-primary;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle { height: Theme.sp-xs; }
+
+                Text {
+                    text: "Accept and remember the server's certificate on first connection";
+                    font-size: 11px;
+                    color: Theme.text-muted;
+                }
+
+                // Spacer to push buttons down
+                Rectangle { vertical-stretch: 1; }
+
+                // ── Loading indicator ──────────────────────────────
+                if is-loading: HorizontalLayout {
+                    spacing: Theme.sp-sm;
+                    alignment: center;
+                    height: 30px;
+
+                    // Simple animated spinner dot
+                    Text {
+                        text: "Connecting to drive...";
+                        font-size: 13px;
+                        color: Theme.text-secondary;
+                    }
+                }
+
+                Rectangle { height: Theme.sp-sm; }
+
+                // ── Action Buttons ─────────────────────────────────
+                HorizontalLayout {
+                    alignment: space-between;
+
+                    PrimaryButton {
+                        label: "Cancel";
+                        fill: Theme.accent-subtle;
+                        text-color: Theme.text-primary;
+                        border-color: Theme.border;
+                        has-border: true;
+                        enabled: !root.is-loading;
+                        clicked => { root.cancelled(); }
+                    }
+
+                    PrimaryButton {
+                        label: "Connect";
+                        enabled: root.can-submit;
+                        clicked => { root.submitted(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Main App Window ────────────────────────────────────────────────────────
+
+export component AppWindow inherits Window {
+    title: "Drive Manager";
+    min-width: 900px;
+    min-height: 500px;
+    preferred-width: 1400px;
+    preferred-height: 600px;
+    background: Theme.bg-primary;
+
+    // ── Public Properties (set from Rust) ──────────────────────────────
+    in property <[ConnectionInfo]> connections;
+    in property <bool>             is-elevated: false;
+    in property <bool>             is-connecting: false;
+    in property <string>           loading-key: "";
+
+    // ── Dialog state ───────────────────────────────────────────────────
+    in-out property <bool> dialog-open: false;
+
+    // ── Callbacks (handled in Rust) ────────────────────────────────────
+    callback connect-drive(int /* connection-type */, string /* system */,
+                           string /* username */, string /* password */,
+                           int /* scope-type */, bool /* tofu */);
+    callback disconnect(int /* connection-index */);
+    callback mount-clicked(int /* connection-index */, int /* drive-index */);
+    callback scope-clicked(int /* connection-index */, int /* drive-index */);
+    callback compress-toggled(int /* connection-index */, int /* drive-index */, bool);
+    callback mount-path-changed(int /* connection-index */, int /* drive-index */, string);
+
+    VerticalLayout {
+        spacing: 0;
+
+        // ── Scrollable Content ─────────────────────────────────────
+        Flickable {
+            viewport-height: content.preferred-height;
+
+            content := VerticalLayout {
+                spacing: 0;
+                padding-top: Theme.sp-lg;
+
+                // ── Header ─────────────────────────────────────────
+                HorizontalLayout {
+                    padding-left: Theme.page-pad;
+                    padding-right: Theme.page-pad;
+                    alignment: stretch;
+
+                    VerticalLayout {
+                        spacing: Theme.sp-xs;
+                        horizontal-stretch: 1;
+
+                        Text {
+                            text: "Drive Manager";
+                            font-size: 26px;
+                            font-weight: 700;
+                            color: Theme.text-primary;
+                        }
+
+                        Text {
+                            text: "Manage local and remote storage connections";
+                            font-size: 13px;
+                            color: Theme.text-secondary;
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+
+                        PrimaryButton {
+                            label: "+ Connect Drive";
+                            btn-min-width: 150px;
+                            clicked => { root.dialog-open = true; }
+                        }
+                    }
+                }
+
+                Rectangle { height: Theme.sp-sm; }
+
+                // ── Separator ──────────────────────────────────────
+                HorizontalLayout {
+                    padding-left: Theme.page-pad;
+                    padding-right: Theme.page-pad;
+
+                    Rectangle {
+                        height: 1px;
+                        background: Theme.border-light;
+                    }
+                }
+
+                Rectangle { height: Theme.sp-lg; }
+
+                // ── Connections ─────────────────────────────────────
+                for connection[ci] in root.connections: VerticalLayout {
+                    spacing: 0;
+
+                    ConnectionSection {
+                        connection: connection;
+                        connection-index: ci;
+                        is-elevated: root.is-elevated;
+                        loading-key: root.loading-key;
+
+                        disconnect-clicked(ci)          => { root.disconnect(ci); }
+                        mount-clicked(ci, di)           => { root.mount-clicked(ci, di); }
+                        scope-clicked(ci, di)           => { root.scope-clicked(ci, di); }
+                        compress-toggled(ci, di, val)    => { root.compress-toggled(ci, di, val); }
+                        mount-path-changed(ci, di, val) => { root.mount-path-changed(ci, di, val); }
+                    }
+
+                    Rectangle { height: Theme.sp-lg; }
+                }
+
+                // ── Empty State ────────────────────────────────────
+                if connections.length == 0: Rectangle {
+                    height: 200px;
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: Theme.sp-sm;
+
+                        Text {
+                            text: "No connections yet";
+                            font-size: 16px;
+                            font-weight: 600;
+                            color: Theme.text-secondary;
+                            horizontal-alignment: center;
+                        }
+
+                        Text {
+                            text: "Click \"+ Connect Drive\" to add a remote drive";
+                            font-size: 13px;
+                            color: Theme.text-muted;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Connect Dialog (overlay) ───────────────────────────────────────
+    dialog := ConnectDialog {
+        open <=> root.dialog-open;
+        is-loading: root.is-connecting;
+        is-elevated: root.is-elevated;
+
+        submitted => {
+            root.connect-drive(
+                dialog.connection-type,
+                dialog.system,
+                dialog.username,
+                dialog.password,
+                dialog.scope-type,
+                dialog.tofu-enabled,
+            );
+        }
+
+        cancelled => {
+            root.dialog-open = false;
+            dialog.system = "";
+            dialog.username = "";
+            dialog.password = "";
+            dialog.connection-type = 0;
+            dialog.scope-type = 0;
+            dialog.tofu-enabled = false;
+        }
+    }
+}

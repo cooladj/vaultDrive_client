@@ -49,6 +49,7 @@ fn main() -> Result<()> {
             }
         }
     }
+    slint_build::compile("ui/app.slint").unwrap();
 
     println!("cargo:rerun-if-changed=proto/vaultdrive.proto");
     println!("cargo:rerun-if-changed=proto/hub.proto");
