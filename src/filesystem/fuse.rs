@@ -1256,12 +1256,15 @@ impl Filesystem for VirtualFileSystem {
 
 pub async fn mount(
     client: Arc<VaultDriveClient>,
-    mount_point: &str,
+    mount_point: &mut String,
     drive: &str,
     scope: Arc<RwLock<String>>,
     compression: Arc<AtomicBool>
 ) -> Result<()> {
     info!("Mounting VaultDrive at {}", mount_point);
+    if mount_point.is_empty() {
+        *mount_point = next_free_drive().context("No free drive letters available")?;
+    }
 
     let mount_point = normalize_mount_point(mount_point)?;
     let handle = Handle::current();
@@ -1323,4 +1326,18 @@ fn normalize_mount_point(raw: &str) -> Result<String> {
     }
 
     Ok(trimmed.to_string())
+}
+
+pub fn next_free_drive() -> Result<String> {
+    let base = "/mnt";
+    (0..=99u32)
+        .find_map(|i| {
+            let path = format!("{}/vaultdrive-{}", base, i);
+            if !std::path::Path::new(&path).exists() {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("No free mount points available (exhausted /mnt/vaultdrive-0 through -99)"))
 }

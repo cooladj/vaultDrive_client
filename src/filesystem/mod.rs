@@ -29,7 +29,7 @@ pub async fn mount(
 
     #[cfg(unix)]
     {
-        let mount = fuse::mount(client.clone(), mount_point, drive, scope, compress).await?;
+        let mount = fuse::mount(client.clone(), &mut mount_point.to_string(), drive, scope, compress).await?;
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]

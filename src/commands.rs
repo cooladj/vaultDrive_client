@@ -228,6 +228,13 @@ pub async fn execute_unmount(mount_point: String, server: SocketAddr, username:S
             .map(|hostname| (ConnectionType::Hub, hostname.clone()))
             .unwrap_or_else(|| (ConnectionType::Direct, server.to_string()));
 
+        #[cfg(unix)]{
+                if let Err(e) = std::fs::remove_dir(&mount_point) {
+                    tracing::warn!("Failed to remove mount dir {}: {}", mount_point, e);
+                }
+
+        }
+
 
 
             remove_mount(connection_type, &connection_point, &username, &mount_point).await?;
