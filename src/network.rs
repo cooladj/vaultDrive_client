@@ -23,6 +23,7 @@ use quinn::udp::{RecvMeta, Transmit};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
 use tracing::error;
+use unsigned_varint::aio;
 use crate::autoRun::{contain_cert, insert_cert};
 use crate::client::{ VAULT_DRIVE_MAP};
 use crate::commands::{connection_direct};
@@ -430,20 +431,17 @@ impl ServerCertVerifier for AcceptAllVerifier {
 
 
 pub async fn write_message<T: Message>(send: &mut SendStream, msg: &T) -> Result<()> {
-    let buf = msg.encode_to_vec();
-    
-    send.write_u32(buf.len() as u32).await.context("Failed to write length")?;
+    let buf = msg.encode_length_delimited_to_vec();
     send.write_all(&buf).await.context("Failed to write message")?;
-    send.flush().await.context("Failed to flush message")?;
 
 
     Ok(())
 }
 
 pub async fn read_message<T: Message + Default>(recv: &mut RecvStream) -> Result<T> {
-    let len = recv.read_u32().await
-        .context("Failed to read message length")? as usize;
 
+    let len = aio::read_usize(&mut *recv).await
+        .context("Failed to read length prefix")?;
     let mut msg_buf = vec![0u8; len];
     recv.read_exact(&mut msg_buf).await
         .context("Failed to read message body")?;
