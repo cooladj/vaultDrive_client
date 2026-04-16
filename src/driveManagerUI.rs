@@ -1,4 +1,4 @@
-﻿use std::net::SocketAddr;
+use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use strum_macros::Display;
@@ -146,7 +146,7 @@ async fn execute_and_refresh(command: SocketCommand) -> Result<Vec<Connection>, 
         connection: None,
         elevated: elevated(),
     })
-        .await
+    .await
     {
         Ok(CommandResponse::Success(ResponseData::VolumesInfoData(connections))) => {
             Ok(connections)
@@ -166,7 +166,7 @@ fn update_ui(ui: &slint::Weak<AppWindow>, connections: Vec<Connection>) {
             window.set_is_connecting(false);
         }
     })
-        .ok();
+    .ok();
 }
 
 fn show_error(ui: &slint::Weak<AppWindow>, err: &str) {
@@ -178,7 +178,7 @@ fn show_error(ui: &slint::Weak<AppWindow>, err: &str) {
             window.set_is_connecting(false);
         }
     })
-        .ok();
+    .ok();
 }
 
 // ── Async dispatcher ───────────────────────────────────────────────────────
@@ -187,12 +187,17 @@ fn show_error(ui: &slint::Weak<AppWindow>, err: &str) {
 
 fn spawn_command(
     ui: &slint::Weak<AppWindow>,
+    state: &std::sync::Arc<std::sync::Mutex<Vec<Connection>>>,
     command: SocketCommand,
 ) {
     let ui = ui.clone();
+    let state = state.clone();
     tokio::spawn(async move {
         match execute_and_refresh(command).await {
-            Ok(connections) => update_ui(&ui, connections),
+            Ok(connections) => {
+                *state.lock().unwrap() = connections.clone();
+                update_ui(&ui, connections);
+            }
             Err(e) => show_error(&ui, &e),
         }
     });
@@ -207,7 +212,7 @@ pub async fn run_ui() -> Result<(), slint::PlatformError> {
         connection: None,
         elevated: elevated(),
     })
-        .await
+    .await
     {
         Ok(CommandResponse::Success(ResponseData::VolumesInfoData(c))) => c,
         _ => vec![],
@@ -256,16 +261,17 @@ pub async fn run_ui() -> Result<(), slint::PlatformError> {
                     Ok(connections) => {
                         // Update shared state
                         *state.lock().unwrap() = connections.clone();
-                        // Update UI + close dialog
+                        // Update UI + close dialog + clear form
                         let ui = ui2.clone();
                         slint::invoke_from_event_loop(move || {
                             if let Some(window) = ui.upgrade() {
                                 window.set_connections(connections_to_model(&connections));
                                 window.set_is_connecting(false);
                                 window.set_dialog_open(false);
+                                window.invoke_clear_dialog();
                             }
                         })
-                            .ok();
+                        .ok();
                     }
                     Err(e) => show_error(&ui2, &e),
                 }
@@ -278,13 +284,15 @@ pub async fn run_ui() -> Result<(), slint::PlatformError> {
         let ui = app.as_weak();
         let state = state.clone();
         app.on_disconnect(move |ci| {
-            let conns = state.lock().unwrap();
-            if let Some(conn) = conns.get(ci as usize) {
-                let command = SocketCommand::Disconnect {
+            let command = {
+                let conns = state.lock().unwrap();
+                conns.get(ci as usize).map(|conn| SocketCommand::Disconnect {
                     username: conn.username.clone(),
                     socketaddr: conn.ip_addr,
-                };
-                spawn_command(&ui, command);
+                })
+            };
+            if let Some(command) = command {
+                spawn_command(&ui, &state, command);
             }
         });
     }
@@ -294,34 +302,36 @@ pub async fn run_ui() -> Result<(), slint::PlatformError> {
         let ui = app.as_weak();
         let state = state.clone();
         app.on_mount_clicked(move |ci, di| {
-            let conns = state.lock().unwrap();
-            if let Some(conn) = conns.get(ci as usize) {
-                if let Some(drive) = conn.drive.get(di as usize) {
-                    let command = if drive.mounted {
-                        SocketCommand::UnMount {
-                            username: conn.username.clone(),
-                            socketaddr: conn.ip_addr,
-                            mount_point: drive.mount_path.clone(),
-                        }
-                    } else {
-                        SocketCommand::Mount {
-                            mount_point: drive.mount_path.clone(),
-                            drive: drive.server_mount_point.clone(),
-                            socketaddr: conn.ip_addr,
-                            username: conn.username.clone(),
-                            scope: drive.scope.clone(),
-                            compress: drive.compress,
-                        }
-                    };
-
-                    if let Some(window) = ui.upgrade() {
-                        window.set_loading_key(
-                            format!("{}-mount", drive.server_mount_point).into(),
-                        );
-                    }
-
-                    spawn_command(&ui, command);
+            let result = {
+                let conns = state.lock().unwrap();
+                conns.get(ci as usize).and_then(|conn| {
+                    conn.drive.get(di as usize).map(|drive| {
+                        let command = if drive.mounted {
+                            SocketCommand::UnMount {
+                                username: conn.username.clone(),
+                                socketaddr: conn.ip_addr,
+                                mount_point: drive.mount_path.clone(),
+                            }
+                        } else {
+                            SocketCommand::Mount {
+                                mount_point: drive.mount_path.clone(),
+                                drive: drive.server_mount_point.clone(),
+                                socketaddr: conn.ip_addr,
+                                username: conn.username.clone(),
+                                scope: drive.scope.clone(),
+                                compress: drive.compress,
+                            }
+                        };
+                        let loading = format!("{}-mount", drive.server_mount_point);
+                        (command, loading)
+                    })
+                })
+            };
+            if let Some((command, loading)) = result {
+                if let Some(window) = ui.upgrade() {
+                    window.set_loading_key(loading.into());
                 }
+                spawn_command(&ui, &state, command);
             }
         });
     }
@@ -331,27 +341,28 @@ pub async fn run_ui() -> Result<(), slint::PlatformError> {
         let ui = app.as_weak();
         let state = state.clone();
         app.on_scope_clicked(move |ci, di| {
-            let mut conns = state.lock().unwrap();
-            if let Some(conn) = conns.get_mut(ci as usize) {
-                if let Some(drive) = conn.drive.get_mut(di as usize) {
-                    // Toggle scope
-                    drive.scope = if drive.scope.is_empty() {
-                        get_user_id().unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-
-                    let command = SocketCommand::Mount {
-                        mount_point: drive.mount_path.clone(),
-                        drive: drive.server_mount_point.clone(),
-                        socketaddr: conn.ip_addr,
-                        username: conn.username.clone(),
-                        scope: drive.scope.clone(),
-                        compress: drive.compress,
-                    };
-
-                    spawn_command(&ui, command);
-                }
+            let command = {
+                let mut conns = state.lock().unwrap();
+                conns.get_mut(ci as usize).and_then(|conn| {
+                    conn.drive.get_mut(di as usize).map(|drive| {
+                        drive.scope = if drive.scope.is_empty() {
+                            get_user_id().unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        SocketCommand::Mount {
+                            mount_point: drive.mount_path.clone(),
+                            drive: drive.server_mount_point.clone(),
+                            socketaddr: conn.ip_addr,
+                            username: conn.username.clone(),
+                            scope: drive.scope.clone(),
+                            compress: drive.compress,
+                        }
+                    })
+                })
+            };
+            if let Some(command) = command {
+                spawn_command(&ui, &state, command);
             }
         });
     }
@@ -361,22 +372,24 @@ pub async fn run_ui() -> Result<(), slint::PlatformError> {
         let ui = app.as_weak();
         let state = state.clone();
         app.on_compress_toggled(move |ci, di, val| {
-            let mut conns = state.lock().unwrap();
-            if let Some(conn) = conns.get_mut(ci as usize) {
-                if let Some(drive) = conn.drive.get_mut(di as usize) {
-                    drive.compress = val;
-
-                    let command = SocketCommand::Mount {
-                        mount_point: drive.mount_path.clone(),
-                        drive: drive.server_mount_point.clone(),
-                        socketaddr: conn.ip_addr,
-                        username: conn.username.clone(),
-                        scope: drive.scope.clone(),
-                        compress: val,
-                    };
-
-                    spawn_command(&ui, command);
-                }
+            let command = {
+                let mut conns = state.lock().unwrap();
+                conns.get_mut(ci as usize).and_then(|conn| {
+                    conn.drive.get_mut(di as usize).map(|drive| {
+                        drive.compress = val;
+                        SocketCommand::Mount {
+                            mount_point: drive.mount_path.clone(),
+                            drive: drive.server_mount_point.clone(),
+                            socketaddr: conn.ip_addr,
+                            username: conn.username.clone(),
+                            scope: drive.scope.clone(),
+                            compress: val,
+                        }
+                    })
+                })
+            };
+            if let Some(command) = command {
+                spawn_command(&ui, &state, command);
             }
         });
     }

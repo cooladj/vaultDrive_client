@@ -113,25 +113,19 @@ component ToggleSwitch {
 component StatusBadge {
     in property <bool> mounted;
 
-    HorizontalLayout {
-        alignment: center;
-        Rectangle {
-            border-radius: Theme.radius-sm;
-            background: mounted ? Theme.success-light : Theme.accent-subtle;
-            height: 24px;
+    Rectangle {
+        border-radius: Theme.radius-sm;
+        background: mounted ? Theme.success-light : Theme.accent-subtle;
+        height: 24px;
+        width: badge-text.preferred-width + 20px;
 
-            HorizontalLayout {
-                padding-left: 10px;
-                padding-right: 10px;
-                alignment: center;
-
-                Text {
-                    text: mounted ? "Mounted" : "Unmounted";
-                    font-size: 11px;
-                    font-weight: 700;
-                    color: mounted ? Theme.success : Theme.text-secondary;
-                }
-            }
+        badge-text := Text {
+            text: mounted ? "Mounted" : "Unmounted";
+            font-size: 11px;
+            font-weight: 700;
+            color: mounted ? Theme.success : Theme.text-secondary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
         }
     }
 }
@@ -413,25 +407,29 @@ component DriveCard {
 
                 if drive.mounted: HorizontalLayout {
                     spacing: Theme.sp-sm;
-                    alignment: center;
-
-                    ToggleSwitch {
-                        checked: drive.compress;
-                        enabled: !is-loading;
-                        toggled(val) => {
-                            root.compress-toggled(
-                                root.connection-index,
-                                root.drive-index,
-                                val,
-                            );
-                        }
-                    }
+                    height: Theme.btn-h-sm;
 
                     Text {
                         text: "Compress";
                         font-size: 12px;
                         color: Theme.text-primary;
                         vertical-alignment: center;
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+
+                        ToggleSwitch {
+                            checked: drive.compress;
+                            enabled: !is-loading;
+                            toggled(val) => {
+                                root.compress-toggled(
+                                    root.connection-index,
+                                    root.drive-index,
+                                    val,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -460,18 +458,21 @@ component ConnectionSection {
         HorizontalLayout {
             padding-left: Theme.page-pad;
             padding-right: Theme.page-pad;
-            alignment: start;
+            alignment: stretch;
 
             // Status dot
-            Rectangle {
-                width: 8px;
-                height: 8px;
-                border-radius: 4px;
-                background: Theme.success;
-                y: (parent.height - self.height) / 2;
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: Theme.success;
+                }
             }
 
-            Rectangle { width: Theme.sp-sm; }
+            Rectangle { width: Theme.sp-sm; horizontal-stretch: 0; }
 
             Text {
                 text: "\{connection.ip-addr} → \{connection.host-name} → \{connection.username}";
@@ -482,13 +483,18 @@ component ConnectionSection {
                 horizontal-stretch: 1;
             }
 
-            PrimaryButton {
-                label: "Disconnect";
-                fill: Theme.danger-light;
-                text-color: Theme.danger;
-                btn-height: Theme.btn-h-sm;
-                btn-min-width: 130px;
-                clicked => { root.disconnect-clicked(root.connection-index); }
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+
+                PrimaryButton {
+                    label: "Disconnect";
+                    fill: Theme.danger-light;
+                    text-color: Theme.danger;
+                    btn-height: Theme.btn-h-sm;
+                    btn-min-width: 130px;
+                    clicked => { root.disconnect-clicked(root.connection-index); }
+                }
             }
         }
 
@@ -812,6 +818,16 @@ export component AppWindow inherits Window {
     callback scope-clicked(int /* connection-index */, int /* drive-index */);
     callback compress-toggled(int /* connection-index */, int /* drive-index */, bool);
     callback mount-path-changed(int /* connection-index */, int /* drive-index */, string);
+
+    // Called from Rust after successful connect to reset the dialog
+    public function clear-dialog() {
+        dialog.system = "";
+        dialog.username = "";
+        dialog.password = "";
+        dialog.connection-type = 0;
+        dialog.scope-type = 0;
+        dialog.tofu-enabled = false;
+    }
 
     VerticalLayout {
         spacing: 0;
