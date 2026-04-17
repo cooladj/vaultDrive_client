@@ -431,7 +431,10 @@ impl ServerCertVerifier for AcceptAllVerifier {
 
 
 pub async fn write_message<T: Message>(send: &mut SendStream, msg: &T) -> Result<()> {
-    let buf = msg.encode_length_delimited_to_vec();
+    let buf = msg.encode_to_vec();
+    let mut len_buf = unsigned_varint::encode::usize_buffer();
+    let len_encoded = unsigned_varint::encode::usize(buf.len(), &mut len_buf);
+    send.write_all(len_encoded).await?;
     send.write_all(&buf).await.context("Failed to write message")?;
 
 
