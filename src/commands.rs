@@ -159,7 +159,7 @@ pub async fn send_command_to_daemon(command: SocketCommand) -> Result<CommandRes
         Ok(s) => s,
         Err(e) => {
             tracing::debug!("Failed to connect to daemon: {:?}", e.kind());
-            return Ok(CommandResponse::Error(e.to_string()));
+            return Err(anyhow::anyhow!("failed to connection to daemon: {}", e.to_string()));
         }
     };
 

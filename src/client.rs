@@ -363,7 +363,11 @@ impl VaultDriveClient {
             mounts: None,
         };
 
+        debug!("sending authenticate");
+
         let result = authenticate(&mut send, &mut recv, username, password, connection_row).await;
+
+        debug!("failed to authenticate");
 
 
         result

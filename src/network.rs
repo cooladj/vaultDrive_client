@@ -227,34 +227,6 @@ impl QuicClient {
 
 }
 
-pub fn pin_cert_client_config(cert:  Vec<u8>) -> Result<ClientConfig> {
-    let mut transport = TransportConfig::default();
-    transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
-
-    let tofu_verifier: PinnedCertVerifier = PinnedCertVerifier{
-        expected_cert: cert,
-    };
-
-
-
-    let mut crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(tofu_verifier))
-        .with_no_client_auth();
-
-    crypto.alpn_protocols = vec![b"vaultdrive".to_vec()];
-
-
-    let mut client_config = ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?
-    ));
-    let mut transport = TransportConfig::default();
-    transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
-    client_config.transport_config(Arc::new(transport));
-
-    Ok(client_config)
-}
-
 
 fn tofu_client_config(tofu_enable: bool, token: Option<Vec<u8>> ) -> Result<ClientConfig> {
     let mut transport = TransportConfig::default();

@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use anyhow::{Context, Result, bail};
-use crate::network::{pin_cert_client_config, read_message, write_message, QuicClient};
+use crate::network::{ read_message, write_message, QuicClient};
 use crate::proto::vaultdrive::*;
 use quinn::{ RecvStream, SendStream};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};

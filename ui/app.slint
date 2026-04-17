@@ -73,7 +73,7 @@ export struct ConnectionInfo {
 // ── Toggle Switch ──────────────────────────────────────────────────────────
 
 component ToggleSwitch {
-    in-out property <bool> checked;
+    in property <bool> checked;
     in property <bool> enabled: true;
     callback toggled(bool);
 
@@ -84,12 +84,12 @@ component ToggleSwitch {
         width: 100%;
         height: 100%;
         border-radius: self.height / 2;
-        background: checked ? Theme.accent : #c8c8cd;
+        background: root.checked ? Theme.accent : #c8c8cd;
         animate background { duration: 200ms; easing: ease-in-out; }
 
         // Knob
         Rectangle {
-            x: checked ? parent.width - self.width - 2px : 2px;
+            x: root.checked ? parent.width - self.width - 2px : 2px;
             y: (parent.height - self.height) / 2;
             width: parent.height - 5px;
             height: parent.height - 5px;
@@ -102,8 +102,7 @@ component ToggleSwitch {
     TouchArea {
         enabled: root.enabled;
         clicked => {
-            root.checked = !root.checked;
-            root.toggled(root.checked);
+            root.toggled(!root.checked);
         }
     }
 }
@@ -726,8 +725,11 @@ component ConnectDialog {
                     alignment: start;
 
                     ToggleSwitch {
-                        checked <=> root.tofu-enabled;
+                        checked: root.tofu-enabled;
                         enabled: !root.is-loading;
+                        toggled(val) => {
+                            root.tofu-enabled = val;
+                        }
                     }
 
                     Text {

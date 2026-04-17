@@ -108,62 +108,67 @@ async fn main() -> Result<()> {
     }
         }
     } else {
-        // This is the main/GUI process
         info!("Starting main process");
 
-        match send_command_to_daemon(SocketCommand::Health).await {
+        // Only attempt daemon management if we have elevated privileges
+        if elevated() {
+            let daemon_healthy = match send_command_to_daemon(SocketCommand::Health).await {
+                Ok(CommandResponse::Success(_)) => {
+                    info!("Daemon already running and healthy");
+                    true
+                }
+                // Daemon process exists but returned an error, or socket exists but unhealthy
+                Ok(CommandResponse::Error(e)) => {
+                    warn!("Daemon returned error: {}", e);
+                    false
+                }
+                // Socket not found / connection refused — daemon isn't running
+                Err(e) => {
+                    debug!("Could not reach daemon: {}", e);
+                    false
+                }
+            };
 
-            Ok(command) => {
-                match command {
-                    CommandResponse::Success(_) => {
-                        info!("Daemon already running");
+            if !daemon_healthy {
+                if deamonize::is_daemon_running()? {
+                    warn!("Daemon process is running but not responding — restarting");
+                } else {
+                    info!("Daemon not running — spawning");
+                }
 
-                    }
-                    CommandResponse::Error(_) => {
-                        if elevated()
-                        {
-                            restart_process_daemon().await?;
-                            match retry(|| async {
-                                send_command_to_daemon(SocketCommand::Health).await
-                            }, 3, 25).await {
-                                Ok(_) => debug!("Daemon listening to commands"),
-                                Err(e) => debug!("Health check failed after retries: {}", e),
+                match deamonize::restart_process_daemon().await {
+                    Ok(_) => {
+                        info!("Daemon spawned successfully");
+                        match retry(|| async {
+                            send_command_to_daemon(SocketCommand::Health).await
+                        }, 5, 500).await {
+                            Ok(CommandResponse::Success(_)) => {
+                                debug!("Daemon ready");
+                            }
+                            Ok(CommandResponse::Error(e)) => {
+                                // Daemon is up but unhealthy
+                                warn!("Daemon unhealthy: {}", e);
+                                return Err(anyhow::anyhow!("Daemon unhealthy: {}", e));
+                            }
+                            Err(e) => {
+                                // Never became reachable
+                                warn!("Daemon never became ready: {}", e);
+                                return Err(e);
                             }
                         }
                     }
-                }
-                }
-            Err(_) =>{
-
-
-
-            }
-
-        }
-
-        if !deamonize::is_daemon_running()? && elevated() {
-            match deamonize::restart_process_daemon().await {
-                Ok(_) => {
-                    info!("Daemon spawned successfully");
-                    // Give daemon time to start
-                    match retry(|| async {
-                        send_command_to_daemon(SocketCommand::Health).await
-                    }, 3, 25).await {
-                        Ok(_) => debug!("Daemon listening to commands"),
-                        Err(e) => debug!("Health check failed after retries: {}", e),
+                    Err(e) => {
+                        warn!("Failed to spawn daemon: {}", e);
+                        return Err(e.into());
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to spawn daemon: {}", e);
-                    return Err(e.into());
-                }
             }
+        } else {
+            debug!("Not elevated — skipping daemon management");
         }
 
         driveManagerUI::run_ui().await.expect("Failed to run drive manager");
-
-
-        info!("Tauri application closed");
+        info!("Drive manager UI closed");
     }
 
     Ok(())
