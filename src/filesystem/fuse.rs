@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use fuser::{FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, INodeNo, KernelConfig, Generation, FileHandle, OpenFlags, FopenFlags, LockOwner, WriteFlags, RenameFlags, AccessFlags, Errno};
+use fuser::{FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, INodeNo, KernelConfig, Generation, FileHandle, OpenFlags, FopenFlags, LockOwner, WriteFlags, RenameFlags, AccessFlags, Errno, SessionACL};
 use libc::{chown, EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, ENOTDIR, ENOTEMPTY, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
@@ -1261,38 +1261,49 @@ pub async fn mount(
     scope: Arc<RwLock<String>>,
     compression: Arc<AtomicBool>
 ) -> Result<()> {
-    info!("Mounting VaultDrive at {}", mount_point);
+    info!("Mounting VaultDrive at '{}'", mount_point);
+
     if mount_point.is_empty() {
         *mount_point = next_free_drive().context("No free drive letters available")?;
+        debug!("Auto-assigned mount point: {}", mount_point);
     }
 
     let mount_point = normalize_mount_point(mount_point)?;
+    debug!("Normalized mount point: {:?}", mount_point);
+
+
+    debug!("Mount point exists: {:?}", mount_point);
+
     let handle = Handle::current();
-    let fs = VirtualFileSystem::new(client.clone(), handle, drive,scope.clone(), compression.clone());
+    let fs = VirtualFileSystem::new(client.clone(), handle, drive, scope.clone(), compression.clone());
+    debug!("VirtualFileSystem created for drive '{}'", drive);
 
     let options = vec![
         MountOption::FSName("vaultdrive".to_string()),
         MountOption::AutoUnmount,
         MountOption::Async,
-        MountOption::DefaultPermissions,
+        MountOption::NoExec,
+        MountOption::NoSuid,
+        MountOption::RW,
+        MountOption::NoDev
     ];
-
-
+    debug!("Mount options: {:?}", options);
 
     info!("Starting FUSE session...");
     let mut config = fuser::Config::default();
+    config.acl = SessionACL::All;
     config.mount_options = options;
 
-
+    debug!("Calling spawn_mount2...");
     let session = fuser::spawn_mount2(fs, &mount_point, &config)
-        .context("Failed to mount filesystem")?;
+        .inspect_err(|e| error!("spawn_mount2 failed: {:?}", e))?;
+    debug!("spawn_mount2 returned successfully");
 
     client.mounts.insert(
-        mount_point.clone(),
+        mount_point,
         (Arc::new(Mutex::new(session)), drive.to_string(), scope, compression),
     );
 
-    info!("Filesystem mounted successfully at {}", mount_point);
 
     Ok(())
 }
@@ -1329,15 +1340,25 @@ fn normalize_mount_point(raw: &str) -> Result<String> {
 }
 
 pub fn next_free_drive() -> Result<String> {
-    let base = "/mnt";
+    let base = "/run/media";
+
+    let mounts = std::fs::read_to_string("/proc/mounts")
+        .context("Failed to read /proc/mounts")?;
+
+    let active_mounts: std::collections::HashSet<&str> = mounts
+        .lines()
+        .filter(|line| line.contains("fuse"))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .collect();
+
     (0..=99u32)
         .find_map(|i| {
             let path = format!("{}/vaultdrive-{}", base, i);
-            if !std::path::Path::new(&path).exists() {
+            if !active_mounts.contains(path.as_str()) {
                 Some(path)
             } else {
                 None
             }
         })
-        .ok_or_else(|| anyhow::anyhow!("No free mount points available (exhausted /mnt/vaultdrive-0 through -99)"))
+        .ok_or_else(|| anyhow::anyhow!("No free mount points available"))
 }

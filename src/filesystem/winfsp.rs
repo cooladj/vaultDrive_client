@@ -1,4 +1,4 @@
-#![cfg(target_os = "windows")]
+#![cfg(windows)]
 
 use anyhow::{Result, bail, anyhow, Context, Error};
 use std::sync::{Arc, OnceLock};
