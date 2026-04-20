@@ -79,6 +79,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Security",
     "Win32_Security_Authorization"
 ] }
+windows-sys = "0.61.2"
 is_elevated = "0.1.2"
 windows-service = "0.8.0"
 

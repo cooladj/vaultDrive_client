@@ -1,3 +1,4 @@
+use std::io;
 use anyhow::{Context, Result, bail, anyhow};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -395,16 +396,11 @@ impl VaultDriveClient {
         write_message(&mut send, &request).await?;
         let response = read_message::<Response>(&mut recv).await?;
 
-        // Check for errors
-        if let Some(response::ResponseType::Error(err)) = &response.response_type {
-            bail!("Server error: {}", err.message);
-        }
-
         Ok(response)
     }
 
     
-    pub async fn open_file(&self, path: &str, file_id: u64, flags: u32) -> Result<OperationSuccessResponse> {
+    pub async fn open_file(&self, path: &str, file_id: u64, flags: u32) -> io::Result<OperationSuccessResponse> {
         let request = Request {
             request_type: Some(request::RequestType::OpenFile(OpenFileRequest {
                 path: path.to_string(),
@@ -412,47 +408,73 @@ impl VaultDriveClient {
                 flags,
             })),
         };
-        let response = self.execute_request(request, None).await?;
+
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
         match response.response_type {
-            Some(response::ResponseType::OperationSuccess(operationSuccess)) => Ok(operationSuccess),
-            _ => bail!("Unexpected response type for delete file"),
+            Some(response::ResponseType::OperationSuccess(success)) => Ok(success),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
     }
 
 
-    pub async fn list_directory(&self, path: &str) -> Result<Vec<DirectoryEntry>> {
+    pub async fn list_directory(&self, path: &str) -> io::Result<Vec<DirectoryEntry>> {
         let request = Request {
             request_type: Some(request::RequestType::ListDirectory(ListDirectoryRequest {
                 path: path.to_string(),
             })),
         };
 
-        let response = self.execute_request(request, None).await?;
+
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
 
         match response.response_type {
             Some(response::ResponseType::DirectoryListing(listing)) => {
                 Ok(listing.entries)
             }
-            _ => bail!("Unexpected response type for list directory"),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
     }
     pub async fn flush_file(&self,  file_id: u64,include_file_info: Option<bool>
-    ) -> Result<OperationSuccessResponse> {
+    ) -> io::Result<OperationSuccessResponse> {
         let request = Request {
             request_type: Some(request::RequestType::FlushFile(FlushFileRequest {
                 file_id,
                 include_file_info,
             })),
         };
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(success)) => Ok(success),
-            _ => bail!("Unexpected response type for delete file"),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
 
     }
 
-    pub async fn get_file_info(&self, path: &str) -> Result<FileInfoResponse>
+    pub async fn get_file_info(&self, path: &str) -> io::Result<FileInfoResponse>
     {
         debug!("get_file_info");
         let request = Request {
@@ -461,19 +483,25 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
 
         match response.response_type {
             Some(response::ResponseType::FileInfo(info)) =>{
                 debug!("get_file_info successfully for: {:?}", path);
                 Ok(info)},
-            _ => {
-                debug!("failed to get file info for: {:?}", path);
-                bail!("Unexpected response type for get file info")},
+    Some(response::ResponseType::Error(error)) => Err(error.into()),
+    _ => Err(io::Error::new(
+    io::ErrorKind::Other,
+    "unexpected response type",
+    )),
         }
     }
 
-    pub async fn read_file(&self, path: &str, offset: u64, length: u32, file_id: u64, compress: Arc<AtomicBool>) -> Result<Vec<u8>> {
+    pub async fn read_file(&self, path: &str, offset: u64, length: u32, file_id: u64, compress: Arc<AtomicBool>) -> io::Result<Vec<u8>> {
 
 
         let request = Request {
@@ -486,7 +514,11 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
 
         match response.response_type {
             Some(response::ResponseType::FileData(data)) => {
@@ -498,10 +530,13 @@ impl VaultDriveClient {
                 };
                 Ok(bytes)
             }
-            _ => bail!("Unexpected response type for read file"),
+    _ => Err(io::Error::new(
+    io::ErrorKind::Other,
+    "unexpected response type",
+    )),
         }
     }
-    pub async fn create_file(&self, path: &str, flags: u32, file_id: u64, include_file_info: Option<bool>) -> Result<OperationSuccessResponse> {
+    pub async fn create_file(&self, path: &str, flags: u32, file_id: u64, include_file_info: Option<bool>) -> io::Result<OperationSuccessResponse> {
         let request = Request {
             request_type: Some(request::RequestType::CreateFile(CreateFileRequest {
                 path: path.to_string(),
@@ -510,37 +545,47 @@ impl VaultDriveClient {
                 include_file_info,
             })),
         };
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(success)) => Ok(success),
-            _ => bail!("Unexpected response type for delete file"),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
-
     }
+
+
     pub async fn override_file(
         &self,
         file_id: u64,
         include_file_info: Option<bool>
-    ) -> Result<OperationSuccessResponse> {
+    ) -> io::Result<OperationSuccessResponse> {
         let request = Request {
             request_type: Some(request::RequestType::OverrideFile(OverrideFileRequest {
                 file_id,
                 include_file_info,
             })),
         };
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         match response.response_type {
-            Some(response::ResponseType::OperationSuccess(success)) => {
-                Ok(success)
-            }
-            _ => bail!("Unexpected response type for override file"),
+            Some(response::ResponseType::OperationSuccess(success)) => Ok(success),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
     }
-
-
-
 
 
 
@@ -555,7 +600,7 @@ impl VaultDriveClient {
         is_compressed: bool,
         include_file_info: Option<bool>,
         stream: Option<(SendStream, RecvStream)>,
-    ) -> Result<WriteSuccessResponse> {
+    ) -> io::Result<WriteSuccessResponse> {
         let (data, compressed) = if compress.load(Ordering::Relaxed)
             && !is_compressed
         {
@@ -581,29 +626,42 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request, stream).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         match response.response_type {
-            Some(response::ResponseType::WriteSuccess(success)) => {
-                Ok(success)
-            }
-            _ => bail!("Unexpected response type for write file"),
+            Some(response::ResponseType::WriteSuccess(success)) => Ok(success),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
     }
-    pub async fn close_file(&self, file_handler: u64) -> Result<()> {
+    pub async fn close_file(&self, file_handler: u64) -> io::Result<()> {
         let request = Request{
             request_type:Some(request::RequestType::CloseFile(CloseFileRequest{
                 file_handler,
             }))
         };
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
         match response.response_type {
-            Some(response::ResponseType::OperationSuccess(_)) => Ok(()),
-            _ => bail!("Unexpected response type for delete file"),
+            Some(response::ResponseType::OperationSuccess(success)) => Ok(()),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
     }
 
-    pub async fn delete_file(&self, path: &str) -> Result<()> {
+    pub async fn delete_file(&self, path: &str) -> io::Result<()> {
 
         let request = Request {
             request_type: Some(request::RequestType::DeleteFile(DeleteFileRequest {
@@ -611,15 +669,22 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         match response.response_type {
-            Some(response::ResponseType::OperationSuccess(_)) => Ok(()),
-            _ => bail!("Unexpected response type for delete file"),
+            Some(response::ResponseType::OperationSuccess(success)) => Ok(()),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
     }
 
-    pub async fn rename_file(&self, old_path: &str, new_path: &str) -> Result<()> {
+    pub async fn rename_file(&self, old_path: &str, new_path: &str) -> io::Result<()> {
 
 
         let request = Request {
@@ -629,16 +694,23 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         match response.response_type {
-            Some(response::ResponseType::OperationSuccess(_)) => Ok(()),
-            _ => bail!("Unexpected response type for rename file"),
+            Some(response::ResponseType::OperationSuccess(success)) => Ok(()),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
     }
 
     pub async fn create_directory(&self, path: &str, include_file_info: Option<bool>
-    ) -> Result<OperationSuccessResponse> {
+    ) -> io::Result<OperationSuccessResponse> {
         let request = Request {
             request_type: Some(request::RequestType::CreateDirectory(CreateDirectoryRequest {
                 path: path.to_string(),
@@ -647,43 +719,64 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         match response.response_type {
             Some(response::ResponseType::OperationSuccess(success)) => Ok(success),
-            _ => bail!("Unexpected response type for create directory"),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
     }
 
-    pub async fn delete_directory(&self, path: &str) -> Result<()> {
+    pub async fn delete_directory(&self, path: &str) -> io::Result<()> {
         let request = Request {
             request_type: Some(request::RequestType::DeleteDirectory(DeleteDirectoryRequest {
                 path: path.to_string(),
             })),
         };
 
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         match response.response_type {
-            Some(response::ResponseType::OperationSuccess(_)) => Ok(()),
-            _ => bail!("Unexpected response type for delete directory"),
+            Some(response::ResponseType::OperationSuccess(success)) => Ok(()),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
     }
 
-    pub async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
+    pub async fn list_volumes(&self) -> io::Result<Vec<VolumeInfo>> {
         let request = Request {
             request_type: Some(request::RequestType::ListVolumes(ListVolumesRequest {})),
         };
 
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         match response.response_type {
             Some(response::ResponseType::VolumeList(list)) => Ok(list.volumes),
-            _ => bail!("Unexpected response type for list volumes"),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
     }
 
-    pub async fn get_volume_info(&self, volume_id: &str) -> Result<VolumeInfo> {
+    pub async fn get_volume_info(&self, volume_id: &str) -> io::Result<VolumeInfo> {
         debug!("Getting volume info for volume {}", volume_id);
         let request = Request {
             request_type: Some(request::RequestType::GetVolumeInfo(GetVolumeInfoRequest {
@@ -691,11 +784,19 @@ impl VaultDriveClient {
             })),
         };
 
-        let response = self.execute_request(request, None).await?;
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
 
         match response.response_type {
             Some(response::ResponseType::VolumeInfo(info)) => Ok(info.volume.unwrap()),
-            _ => bail!("Unexpected response type for get volume info"),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
         }
     }
     fn do_cleanup(&self, session: &session, server_addr: SocketAddr) {
@@ -758,5 +859,41 @@ impl Drop for VaultDriveClient {
                 self.do_cleanup(session, server_addr);
             }
         }
+    }
+}
+
+impl From<ErrorCode> for io::ErrorKind {
+    fn from(code: ErrorCode) -> Self {
+        use ErrorCode as E;
+        use io::ErrorKind as K;
+
+        match code {
+            E::NotFound             => K::NotFound,
+            E::PermissionDenied     => K::PermissionDenied,
+            E::AlreadyExists        => K::AlreadyExists,
+            E::QuotaExceeded        => K::QuotaExceeded,
+            E::InvalidRequest       => K::InvalidInput,
+            E::InvalidInput         => K::InvalidInput,
+            E::IsADirectory         => K::IsADirectory,
+            E::NotADirectory        => K::NotADirectory,
+            E::InvalidFilename      => K::InvalidFilename,
+
+            // No great ErrorKind for auth — PermissionDenied is the closest
+            // semantic match (caller lacks credentials to perform the op).
+            E::AuthenticationFailed => K::PermissionDenied,
+
+            // Server-side "something broke" and generic IO both collapse to Other.
+            E::InternalError
+            | E::IoError            => K::Other,
+        }
+    }
+}
+impl From<ErrorResponse> for io::Error {
+    fn from(resp: ErrorResponse) -> Self {
+        let kind: io::ErrorKind = match ErrorCode::try_from(resp.code) {
+            Ok(code) => code.into(),
+            Err(_)   => io::ErrorKind::Other, // unknown code from server
+        };
+        io::Error::new(kind, resp.message)
     }
 }

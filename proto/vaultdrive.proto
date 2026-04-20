@@ -292,7 +292,10 @@ enum ErrorCode {
   ALREADY_EXISTS = 3;
   INVALID_REQUEST = 4;
   AUTHENTICATION_FAILED = 5;
-  SESSION_EXPIRED = 6;
-  QUOTA_EXCEEDED = 7;
-  IO_ERROR = 8;
+  QUOTA_EXCEEDED = 6;
+  IO_ERROR = 7;
+  Invalid_Input = 8 ;
+  Is_A_Directory =9;
+  Not_A_Directory = 10;
+  Invalid_Filename = 11;
 }

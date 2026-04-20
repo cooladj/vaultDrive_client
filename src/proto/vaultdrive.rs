@@ -383,9 +383,12 @@ pub enum ErrorCode {
     AlreadyExists = 3,
     InvalidRequest = 4,
     AuthenticationFailed = 5,
-    SessionExpired = 6,
-    QuotaExceeded = 7,
-    IoError = 8,
+    QuotaExceeded = 6,
+    IoError = 7,
+    InvalidInput = 8,
+    IsADirectory = 9,
+    NotADirectory = 10,
+    InvalidFilename = 11,
 }
 impl ErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -400,9 +403,12 @@ impl ErrorCode {
             Self::AlreadyExists => "ALREADY_EXISTS",
             Self::InvalidRequest => "INVALID_REQUEST",
             Self::AuthenticationFailed => "AUTHENTICATION_FAILED",
-            Self::SessionExpired => "SESSION_EXPIRED",
             Self::QuotaExceeded => "QUOTA_EXCEEDED",
             Self::IoError => "IO_ERROR",
+            Self::InvalidInput => "Invalid_Input",
+            Self::IsADirectory => "Is_A_Directory",
+            Self::NotADirectory => "Not_A_Directory",
+            Self::InvalidFilename => "Invalid_Filename",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -414,9 +420,12 @@ impl ErrorCode {
             "ALREADY_EXISTS" => Some(Self::AlreadyExists),
             "INVALID_REQUEST" => Some(Self::InvalidRequest),
             "AUTHENTICATION_FAILED" => Some(Self::AuthenticationFailed),
-            "SESSION_EXPIRED" => Some(Self::SessionExpired),
             "QUOTA_EXCEEDED" => Some(Self::QuotaExceeded),
             "IO_ERROR" => Some(Self::IoError),
+            "Invalid_Input" => Some(Self::InvalidInput),
+            "Is_A_Directory" => Some(Self::IsADirectory),
+            "Not_A_Directory" => Some(Self::NotADirectory),
+            "Invalid_Filename" => Some(Self::InvalidFilename),
             _ => None,
         }
     }

@@ -1,40 +1,33 @@
 #![cfg(target_os = "windows")]
 
 use anyhow::{Result, bail, anyhow, Context, Error};
-use std::sync::{Arc, OnceLock};
-use parking_lot::{Condvar, Once};
-use std::collections::HashMap;
+use std::sync::{Arc};
+use parking_lot::{Once};
+
 use std::ffi::c_void;
 use std::future::Future;
-use std::mem;
-use std::ops::Deref;
+use std::{io, };
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::thread::Scope;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use parking_lot::{RwLock, Mutex};
-use tokio::sync::{oneshot, Mutex as TokioMutex};
+use tokio::sync::{oneshot,};
 
-use bytes::Bytes;
 use tokio::sync::OnceCell;
-use once_cell::sync::{Lazy};
 use dashmap::DashMap;
-use futures::{FutureExt, SinkExt};
 use log::debug;
 use path_slash::PathExt;
-use strum_macros::Display;
 use tokio::join;
 use tokio::runtime::{Handle};
-use tokio::sync::oneshot::error::RecvError;
 use tokio::task::JoinSet;
-use tracing::{info, warn, Instrument};
-use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{LocalFree, HLOCAL, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_NOT_A_DIRECTORY, STATUS_INTERNAL_ERROR, STATUS_UNSUCCESSFUL, STATUS_IO_DEVICE_ERROR, STATUS_INVALID_DEVICE_REQUEST, STATUS_PENDING};
+use tracing::{ warn, Instrument};
+use windows::core::{HSTRING};
+use windows::Win32::Foundation::{LocalFree, HLOCAL,  STATUS_NOT_A_DIRECTORY, STATUS_INTERNAL_ERROR, STATUS_UNSUCCESSFUL, STATUS_IO_DEVICE_ERROR, STATUS_INVALID_DEVICE_REQUEST, STATUS_PENDING};
 use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT};
-
-use windows::Win32::Security::{InitializeSecurityDescriptor, SetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR};
-use windows::Win32::Storage::FileSystem::{GetLogicalDrives, FILE_APPEND_DATA, FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA};
+use windows_sys::Wdk::Storage::FileSystem::{FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE, FILE_NO_INTERMEDIATE_BUFFERING, FILE_WRITE_THROUGH};use windows::Win32::Security::{InitializeSecurityDescriptor, SetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR};
+use windows::Win32::Storage::FileSystem::{GetLogicalDrives, FILE_APPEND_DATA, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA};
 use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
+use windows_sys::Win32::Foundation::{STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_HANDLE};
 use crate::client::VaultDriveClient;
 use crate::proto::vaultdrive::{DirectoryEntry, FileInfoResponse, WriteSuccessResponse};
 
@@ -44,26 +37,19 @@ use winfsp::filesystem::{
     FileSystemContext, AsyncFileSystemContext, FileInfo, VolumeInfo,
     OpenFileInfo, FileSecurity, DirMarker, DirBuffer, ModificationDescriptor
 };
-use winfsp::*;
 
-use winfsp::{FspError, U16CStr, U16CString};
-use winfsp::constants::FspCleanupFlags::FspCleanupSetAllocationSize;
-use winfsp::FspError::NTSTATUS;
+use winfsp::{FspError, U16CStr};
+use winfsp::FspError::{IO, NTSTATUS};
 use winfsp_sys::FILE_FLAGS_AND_ATTRIBUTES;
-use x509_parser::nom::{AsBytes, Parser};
 use crate::filesystem::{InodeAllocator, APPEND, DELETE, DELETE_CHILDREN, DSYNC, EXCL, EXCLUSIVE_LOCK, READ, SHARE_LOCK, SYNC, TRANSVERSE, WINDOW_SHARE_DELETE, WINDOW_SHARE_READ, WINDOW_SHARE_WRITE, WRITE};
-use crate::proto;
 
+
+//todo find what crate has these
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
-const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
-
-const STATUS_SUCCESS: i32 = 0;
-const STATUS_NOT_FOUND: i32 = 0xC0000225_u32 as i32;
-const STATUS_INVALID_HANDLE: i32 = 0xC0000008_u32 as i32;
-const STATUS_FILE_IS_A_DIRECTORY: i32 = 0xC00000BA_u32 as i32;
 
 const FSP_CLEANUP_DELETE: u32 = 0x01;
+
 
 
 
@@ -231,7 +217,7 @@ pub struct VirtualFileSystem {
 
     pending_file_requests: Arc<DashMap<String, Arc<PendingRequest>>>,
     pending_dir_requests: Arc<DashMap<String, Arc<OnceCell<Vec<DirectoryEntry>>>>>,
-    flushable_writes: Arc<DashMap<u64, JoinSet<Result<WriteSuccessResponse>>>>,
+    flushable_writes: Arc<DashMap<u64, JoinSet<io::Result<WriteSuccessResponse>>>>,
 
     scope: Arc<RwLock<String>>,
 
@@ -239,7 +225,7 @@ pub struct VirtualFileSystem {
     compress: Arc<AtomicBool>,
 }
 struct PendingRequest {
-    result: OnceCell<Result<FileNode, i32>>,
+    result: OnceCell<io::Result<FileNode>>,
 }
 
 impl VirtualFileSystem {
@@ -282,9 +268,8 @@ impl VirtualFileSystem {
     }
 
 
-    async fn get_or_fetch_file_info(&self, path: &str) -> Result<FileNode, i32> {
+    async fn get_or_fetch_file_info(&self, path: &str) -> io::Result<FileNode> {
         let path_str = path.to_string();
-
         debug!("get_or_fetch_file_info for: {}", path_str);
 
         let pending = self
@@ -296,33 +281,32 @@ impl VirtualFileSystem {
             .clone();
 
         let result = pending.result.get_or_init(|| async {
-            let unix_path = path_str.replace("\\", "/");
+            let unix_path = path_str.replace('\\', "/");
             debug!("get_or_fetch_file_info unix_path: {}", unix_path);
             const TIMEOUT_DURATION: Duration = Duration::from_secs(5);
 
             match tokio::time::timeout(
                 TIMEOUT_DURATION,
-                self.client.get_file_info(&unix_path)
+                self.client.get_file_info(&unix_path),
             ).await {
-                Ok(Ok(info)) => {
-                    let node = FileNode::from_file_info(info);
-                    Ok(node)
-                }
-                ///this is the issue
-                Ok(Err(_)) => Err(STATUS_OBJECT_NAME_NOT_FOUND.0),
-                Err(_) => {
-                    warn!("File info fetch timed out for {}", unix_path);
-                    Err(STATUS_INTERNAL_ERROR.0)
-                }
+                Ok(Ok(info))  => Ok(FileNode::from_file_info(info)),
+                Ok(Err(err))  => Err(err),
+                Err(_elapsed) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("get_file_info timed out after {:?}", TIMEOUT_DURATION),
+                )),
             }
         }).await;
 
         self.pending_file_requests.remove(&path_str);
 
-        result.clone()
+        match result {
+            Ok(node) => Ok(node.clone()),
+            Err(err) => Err(io::Error::new(err.kind(), err.to_string())),
+        }
     }
 
-    async fn get_or_fetch_directory_list(&self, path: &str) -> Result<Vec<DirectoryEntry>, i32> {
+    async fn get_or_fetch_directory_list(&self, path: &str) -> io::Result<Vec<DirectoryEntry>> {
         let cell = self.pending_dir_requests
             .entry(path.to_string())
             .or_insert_with(|| Arc::new(OnceCell::new()))
@@ -331,11 +315,9 @@ impl VirtualFileSystem {
         let entries = cell.get_or_try_init(|| async {
             tracing::debug!("Fetching directory from network: {}", path);
             let unix_path = self.to_unix_path(path);
-            let entries = self.client.list_directory(&unix_path).await
-                .map_err(|_| STATUS_INTERNAL_ERROR.0)?;
-            Ok::<Vec<DirectoryEntry>, i32>(entries)
-        }).await
-            .map_err(|_| STATUS_INTERNAL_ERROR.0)?;
+            let entries = self.client.list_directory(&unix_path).await?;
+            Ok::<_, io::Error>(entries)
+        }).await?;
 
         self.pending_dir_requests.remove(path);
 
@@ -381,7 +363,7 @@ impl FileSystemContext for VirtualFileSystem {
         let (tx, rx) = oneshot::channel();
         self.handle.spawn(async move {
             let node = self_clone.get_or_fetch_file_info(&path).await
-                .map_err(|_| FspError::from(NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND.0)));
+                .map_err(|err| FspError::from(IO(err.kind())));
             tx.send(node);
         });
         let node = rx.blocking_recv().map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))??;
@@ -433,28 +415,20 @@ impl FileSystemContext for VirtualFileSystem {
             }
         };
 
-        debug!("share_access raw value: {:b} granted_access: {:b}", share_access, granted_access);
 
 
         let mut flags: u32 = 0;
 
-        if (granted_access & FILE_READ_DATA.0) != 0 || (granted_access & FILE_GENERIC_READ.0) != 0 {
+
+        if (granted_access & FILE_READ_DATA.0) != 0 {
             flags |= READ;
         }
-
-        if (granted_access & FILE_WRITE_DATA.0) != 0 || (granted_access & FILE_GENERIC_WRITE.0) != 0 {
+        if (granted_access & (FILE_WRITE_DATA.0 | FILE_APPEND_DATA.0)) != 0 {
             flags |= WRITE;
         }
-
         if (granted_access & FILE_APPEND_DATA.0) != 0 {
             flags |= APPEND;
         }
-        if (_create_options & FILE_FLAG_NO_BUFFERING.0) != 0 && (_create_options & FILE_FLAG_WRITE_THROUGH.0) != 0 {
-            flags |= SYNC;
-        } else if (_create_options & FILE_FLAG_WRITE_THROUGH.0) != 0 {
-            flags |= DSYNC;
-        }
-
 
         if share_access == FILE_SHARE_NONE.0 {
             flags |= EXCLUSIVE_LOCK;
@@ -472,6 +446,11 @@ impl FileSystemContext for VirtualFileSystem {
         }
 
         let path = self.normalize_path(&file_name.to_string_lossy());
+
+        debug!(
+    "open: path={} granted_access={:#x} share_access={:#x} flags={:#x}",
+    path, granted_access, share_access, flags
+);
         let unix_path = self.to_unix_path(&path);
 
         debug!("open was called for {:}  with flags: {:b}", path, flags);
@@ -494,21 +473,21 @@ impl FileSystemContext for VirtualFileSystem {
                     }
                 }
                 (Err(e), _) => {
-                    let _ = tx.send(Err(FspError::from(NTSTATUS(STATUS_IO_DEVICE_ERROR.0))));
+                    let _ = tx.send(Err(FspError::from(IO(e.kind()))));
                 }
-                (_, Err(number)) => {
-                    let _ = tx.send(Err(FspError::from(NTSTATUS(number))));
+                (_, Err(e)) => {
+                    let _ = tx.send(Err(FspError::from(IO(e.kind()))));
                 }
             }
         });
 
         let node = rx.blocking_recv()
-            .map_err(|_| FspError::from(NTSTATUS(STATUS_NOT_FOUND)))??;
+            .map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))??;
 
         let context = OpenFileContext {
             path,
             is_directory: node.is_directory,
-            is_marked_deleted: _create_options & FILE_FLAG_DELETE_ON_CLOSE.0 != 0,
+            is_marked_deleted: _create_options & FILE_DELETE_ON_CLOSE!= 0,
             flags,
             is_compressed: node.is_compressed,
         };
@@ -518,7 +497,7 @@ impl FileSystemContext for VirtualFileSystem {
         let file_info = FileInfo {
             file_attributes: node.file_attributes,
             reparse_tag: 0,
-            allocation_size: ((node.size as u64 + 4095) / 4096) * 4096,
+            allocation_size: node.size as u64,
             file_size: node.size as u64,
             creation_time: system_time_to_filetime(node.creation_time),
             last_access_time: system_time_to_filetime(node.last_access_time),
@@ -596,7 +575,7 @@ fn close(&self, context: Self::FileContext) {
         debug!("create called: {}", file_name.to_string_lossy());
 
         let path = self.normalize_path(&file_name.to_string_lossy());
-        let is_directory = (create_options & 0x00000001) != 0;
+        let is_directory = (create_options & FILE_DIRECTORY_FILE ) != 0;
 
         let unix_path = self.to_unix_path(&path);
         let client = self.client.clone();
@@ -607,20 +586,22 @@ fn close(&self, context: Self::FileContext) {
 
         flags |= EXCL;
 
-        if (_granted_access & FILE_READ_DATA.0) != 0 || (_granted_access & FILE_GENERIC_READ.0) != 0 {
+        if (_granted_access & FILE_READ_DATA.0) != 0 {
             flags |= READ;
         }
-
-        if (_granted_access & FILE_WRITE_DATA.0) != 0 || (_granted_access & FILE_GENERIC_WRITE.0) != 0 {
+        if (_granted_access & (FILE_WRITE_DATA.0 | FILE_APPEND_DATA.0)) != 0 {
             flags |= WRITE;
         }
-
         if (_granted_access & FILE_APPEND_DATA.0) != 0 {
             flags |= APPEND;
         }
-        if (create_options & FILE_FLAG_NO_BUFFERING.0) != 0 && (create_options & FILE_FLAG_WRITE_THROUGH.0) != 0 {
+
+
+        if (create_options & FILE_NO_INTERMEDIATE_BUFFERING) != 0
+            && (create_options & FILE_WRITE_THROUGH) != 0
+        {
             flags |= SYNC;
-        } else if (create_options & FILE_FLAG_WRITE_THROUGH.0) != 0 {
+        } else if (create_options & FILE_WRITE_THROUGH) != 0 {
             flags |= DSYNC;
         }
 
@@ -646,34 +627,34 @@ fn close(&self, context: Self::FileContext) {
                 client.create_file(&unix_path, flags, file_handler.clone(), Some(true)).await
             };
 
-            let _ = tx.send(result);
+            let _ = tx.send(result.map_err(|e| FspError::from(IO(e.kind()))));
         });
 
-        rx.blocking_recv()
+        let success = rx.blocking_recv()
             .map_err(|_| {
                 tracing::error!("create: channel recv failed for {}", path);
                 FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0))
-            })?
-            .map_err(|e| {
-                tracing::error!("create: failed to create {}: {:?}", path, e);
-                FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0))
-            })?;
+            })??;
 
-        let self_clone = self.clone();
-        let (tx, rx) = oneshot::channel();
-        let path_clone = path.clone();
-        self.handle.spawn(async move {
-            let node = self_clone.get_or_fetch_file_info(&path_clone).await
-                .map_err(|_| FspError::from(NTSTATUS(STATUS_NOT_FOUND)));
-            tx.send(node);
-        });
 
-        let node = rx.blocking_recv().map_err(|_| FspError::from(NTSTATUS(STATUS_NOT_FOUND)))??;
+        let node = if let Some(file_info) = success.file_info{
+            FileNode::from_file_info(file_info)
+        } else {
+            let self_clone = self.clone();
+            let (tx, rx) = oneshot::channel();
+            let path_clone = path.clone();
+            self.handle.spawn(async move {
+                let node = self_clone.get_or_fetch_file_info(&path_clone).await
+                    .map_err(|e| FspError::from(IO(e.kind())));
+                tx.send(node);
+            });
+            rx.blocking_recv().map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))??
+        };
 
         let context = OpenFileContext {
             path,
             is_directory,
-            is_marked_deleted: create_options & FILE_FLAG_DELETE_ON_CLOSE.0 != 0,
+            is_marked_deleted: create_options & FILE_DELETE_ON_CLOSE != 0,
             flags,
             is_compressed: node.is_compressed,
         };
@@ -756,12 +737,12 @@ fn close(&self, context: Self::FileContext) {
                 }
             }
                 let unix_path = self.to_unix_path(&open_ctx.path);
-                let client = self.client.clone(); // Clone before moving into async block
+                let client = self.client.clone();
                 let (tx, rx) = oneshot::channel();
 
                 self.handle.spawn(async move {
                     let result = client.delete_file(&unix_path).await;
-                    let _ = tx.send(result); // Ignore send errors (receiver might be dropped)
+                    let _ = tx.send(result);
                 });
 
                 match rx.blocking_recv() {
@@ -794,7 +775,7 @@ fn close(&self, context: Self::FileContext) {
         self.handle.spawn(async move {
            let result= self_clone.client.override_file(context_clone.clone(), Some(true))
                 .await
-                .map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)));
+                .map_err(|e| FspError::from(IO(e.kind())));
 
 
 
@@ -805,18 +786,18 @@ fn close(&self, context: Self::FileContext) {
                     }else {
                         self_clone.get_or_fetch_file_info(open_ctx.path.as_str())
                             .await
-                            .map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))
+                            .map_err(|e| FspError::from(IO(e.kind())))
                     };
                     tx.send(node_result);
                 }
-                Err(_) => {
-                    tx.send(Err(FspError::from(NTSTATUS(STATUS_INVALID_HANDLE))));
+                Err(err) => {
+                    tx.send(Err(err));
                 }
             }
 
         });
 
-        let node=rx.blocking_recv().map_err(|_| FspError::from(NTSTATUS(STATUS_NOT_FOUND)))??;
+        let node=rx.blocking_recv().map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))??;
         *file_info = FileInfo {
             file_attributes: node.file_attributes,
             reparse_tag: 0,
@@ -852,10 +833,10 @@ fn close(&self, context: Self::FileContext) {
         let (tx, rx) = oneshot::channel();
         self.handle.spawn(async move {
             let node = self_clone.get_or_fetch_file_info(&path).await
-                .map_err(|_| FspError::from(NTSTATUS(STATUS_NOT_FOUND)));
+                .map_err(|e| FspError::from(IO(e.kind())));
             tx.send(node);
         });
-        let node=rx.blocking_recv().map_err(|_| FspError::from(NTSTATUS(STATUS_NOT_FOUND)))??;
+        let node=rx.blocking_recv().map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))??;
         *out_file_info = FileInfo {
             file_attributes: node.file_attributes,
             reparse_tag: 0,
@@ -889,10 +870,10 @@ fn close(&self, context: Self::FileContext) {
         let (tx, rx) = oneshot::channel();
         self.handle.spawn(async move {
             let node = self_clone.get_or_fetch_file_info(&path).await
-                .map_err(|_| FspError::from(NTSTATUS(STATUS_NOT_FOUND)));
+                .map_err(|e| FspError::from(IO(e.kind())));
             tx.send(node);
         });
-        let node=rx.blocking_recv().map_err(|_| FspError::from(NTSTATUS(STATUS_NOT_FOUND)))??;
+        let node=rx.blocking_recv().map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))??;
 
 
         let sd = node.create_custom_security_descriptor(self.scope.read().clone())?;
@@ -921,10 +902,6 @@ fn close(&self, context: Self::FileContext) {
         _replace_if_exists: bool,
     ) -> Result<(), FspError> {
         debug!("rename was call");
-        let open_ctx = self.open_files
-            .get(context)
-            .ok_or(FspError::from(NTSTATUS(STATUS_INVALID_HANDLE)))?
-            .clone();
 
         let old_path = self.normalize_path(&file_name.to_string_lossy());
         let new_path = self.normalize_path(&new_file_name.to_string_lossy());
@@ -940,7 +917,7 @@ fn close(&self, context: Self::FileContext) {
             let _ = tx.send(result);
         });
 
-        rx.blocking_recv();
+       rx.blocking_recv().map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))??;
 
         Ok(())
     }
@@ -1027,37 +1004,6 @@ fn close(&self, context: Self::FileContext) {
     }
 
 
-    fn set_basic_info(
-        &self,
-        context: &Self::FileContext,
-        _file_attributes: u32,
-        _creation_time: u64,
-        _last_access_time: u64,
-        _last_write_time: u64,
-        _change_time: u64,
-        out_file_info: &mut FileInfo,
-    ) -> Result<(), FspError> {
-        self.get_file_info(context, out_file_info)
-    }
-
-    fn set_file_size(
-        &self,
-        context: &Self::FileContext,
-        _new_size: u64,
-        _set_allocation_size: bool,
-        out_file_info: &mut FileInfo,
-    ) -> Result<(), FspError> {
-        let open_ctx = self.open_files
-            .get(context)
-            .ok_or(FspError::from(NTSTATUS(STATUS_INVALID_HANDLE)))?
-            .clone();
-
-        if open_ctx.is_directory {
-            return Err(FspError::from(NTSTATUS(STATUS_FILE_IS_A_DIRECTORY)));
-        }
-
-        self.get_file_info(context, out_file_info)
-    }
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> Result<(), FspError> {
         debug!("get_volume_info called");
@@ -1068,26 +1014,24 @@ fn close(&self, context: Self::FileContext) {
 
         self.handle.spawn(async move {
             let result = client.get_volume_info(&*label).await;
-            let _ = tx.send(result);
+            let _ = tx.send(result.map_err(|e| FspError::from(IO(e.kind()))));
         });
 
         let info = rx.blocking_recv()
             .map_err(|_| {
                 tracing::error!("get_volume_info: channel recv failed");
                 FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0))
-            })?
-            .map_err(|e| {
-                tracing::error!("get_volume_info: API call failed: {:?}", e);
-                FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0))
-            })?;
+            })??;
 
-        let mut volume_info = unsafe { mem::zeroed::<VolumeInfo>() };
+        debug!("this is the volume info: {:?}", info);
 
-        volume_info.total_size = info.total_size;
-        volume_info.free_size = info.available_space;
-        volume_info.set_volume_label(&info.name);
 
-        *out_volume_info = volume_info;
+
+        out_volume_info.total_size = info.total_size;
+        out_volume_info.free_size = info.available_space;
+        out_volume_info.set_volume_label(&info.name);
+
+
 
         Ok(())
     }
@@ -1148,7 +1092,7 @@ impl AsyncFileSystemContext for VirtualFileSystem {
                     let data = client
                         .read_file(&path, file_offset, chunk_len as u32, ctx, compress)
                         .await
-                        .map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))?;
+                        .map_err(|e| FspError::from(IO(e.kind())))?;
                     Ok::<(usize, Vec<u8>), FspError>((chunk_offset, data))
                 });
 
@@ -1395,7 +1339,7 @@ pub async fn mount(client: Arc<VaultDriveClient>, mount_point: &mut String, driv
     volume_params.file_info_timeout(10);
     volume_params.dir_info_timeout(10);
     volume_params.security_timeout(1000);
-    volume_params.allow_open_in_kernel_mode(false);
+    volume_params.allow_open_in_kernel_mode(true);
     volume_params.flush_and_purge_on_cleanup(false);
     volume_params.post_cleanup_when_modified_only(false);
 

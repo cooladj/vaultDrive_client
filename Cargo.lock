@@ -6854,6 +6854,7 @@ dependencies = [
  "webpki-roots",
  "windows 0.62.2",
  "windows-service",
+ "windows-sys 0.61.2",
  "winfsp",
  "winfsp-sys",
  "winreg",
