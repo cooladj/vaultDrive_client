@@ -660,6 +660,27 @@ impl VaultDriveClient {
             )),
         }
     }
+    pub async fn delete_state(&self, path: &str) -> io::Result<()> {
+        let request = Request {
+            request_type: Some(request::RequestType::CanDelete(CanDelete {
+                path: path.to_string(),
+            })),
+        };
+
+        let response = self
+            .execute_request(request, None)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        match response.response_type {
+            Some(response::ResponseType::OperationSuccess(success)) => Ok(()),
+            Some(response::ResponseType::Error(error)) => Err(error.into()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unexpected response type",
+            )),
+        }
+    }
+    
 
     pub async fn delete_file(&self, path: &str) -> io::Result<()> {
 

@@ -27,7 +27,8 @@ use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToS
 use windows_sys::Wdk::Storage::FileSystem::{FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE, FILE_NO_INTERMEDIATE_BUFFERING, FILE_WRITE_THROUGH};use windows::Win32::Security::{InitializeSecurityDescriptor, SetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR};
 use windows::Win32::Storage::FileSystem::{GetLogicalDrives, FILE_APPEND_DATA, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA};
 use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
-use windows_sys::Win32::Foundation::{STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_HANDLE};
+use windows_sys::Win32::Foundation::{STATUS_DIRECTORY_NOT_EMPTY, STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_HANDLE};
+
 use crate::client::VaultDriveClient;
 use crate::proto::vaultdrive::{DirectoryEntry, FileInfoResponse, WriteSuccessResponse};
 
@@ -48,7 +49,6 @@ use crate::filesystem::{InodeAllocator, APPEND, DELETE, DELETE_CHILDREN, DSYNC, 
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
 
-const FSP_CLEANUP_DELETE: u32 = 0x01;
 
 
 
@@ -688,7 +688,7 @@ fn close(&self, context: Self::FileContext) {
         flags: u32,
     )  {
         debug!("cleanup was called");
-        if (flags & FSP_CLEANUP_DELETE) == 0 {
+        if (flags & winfsp_sys::FspCleanupDelete as u32) == 0 {
             let context = context.clone();
             let self_clone= self.clone();
 
@@ -708,44 +708,23 @@ fn close(&self, context: Self::FileContext) {
                 }
             };
 
-            if open_ctx.is_directory  {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let path = open_ctx.path.clone();
+            let unix_path = self.to_unix_path(&open_ctx.path);
+            let client = self.client.clone();
+             self.flushable_writes.remove(context);
+            let is_dir = open_ctx.is_directory;
 
-                let self_clone = self.clone();
 
-                self.handle.spawn(async move {
-                    let result = self_clone.get_or_fetch_directory_list(&path).await;
-                    let _ = tx.send(result);
-                });
+            let (tx, rx) = oneshot::channel();
 
-                let entries = match rx.blocking_recv() {
-                    Ok(Ok(e)) => e,
-                    Ok(Err(e)) => {
-                        tracing::error!("cleanup: failed to fetch dir list: {:?}", e);
-                        return;
-                    }
-                    Err(_) => {
-                        tracing::error!("cleanup: oneshot channel closed");
-                        return;
-                    }
+            self.handle.spawn(async move {
+                let result = if is_dir {
+                    client.delete_directory(&unix_path).await
+                } else {
+                    client.delete_file(&unix_path).await
                 };
-
-                if !entries.is_empty() {
-                    tracing::warn!("cleanup: directory not empty, skipping delete: {:?}", open_ctx.path);
-                    return;
-                }
-            }
-                let unix_path = self.to_unix_path(&open_ctx.path);
-                let client = self.client.clone();
-                let (tx, rx) = oneshot::channel();
-
-                self.handle.spawn(async move {
-                    let result = client.delete_file(&unix_path).await;
-                    let _ = tx.send(result);
-                });
-
-                match rx.blocking_recv() {
+                let _ = tx.send(result);
+            });
+            match rx.blocking_recv() {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         tracing::error!("cleanup: failed to delete file: {:?}", e);
@@ -754,7 +733,6 @@ fn close(&self, context: Self::FileContext) {
                         tracing::error!("cleanup: channel recv failed: {}", e);
                     }
                 }
-                self.flushable_writes.remove(context);
 
         }
     }
@@ -926,15 +904,37 @@ fn close(&self, context: Self::FileContext) {
     fn set_delete(
         &self,
         context: &Self::FileContext,
-        file_name: &U16CStr,
+        _file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
-        let mut open_ctx_result = self.open_files
+        let mut open_ctx = self.open_files
             .get_mut(context)
             .ok_or(FspError::from(NTSTATUS(STATUS_INVALID_HANDLE)))?;
 
-        open_ctx_result.is_marked_deleted = delete_file;
+        if !delete_file {
+            open_ctx.is_marked_deleted = false;
+            return Ok(());
+        }
 
+        let path = open_ctx.path.clone();
+        let client = self.client.clone();
+        let (tx, rx) = oneshot::channel();
+
+        self.handle.spawn(async move {
+            let result = client.delete_state(&path).await.map_err(|e| {
+                if e.kind() == io::ErrorKind::DirectoryNotEmpty {
+                    FspError::from(NTSTATUS(STATUS_DIRECTORY_NOT_EMPTY))
+                }else {
+                    FspError::from(IO(e.kind()))
+                }
+            });
+            let _ = tx.send(result);
+        });
+
+        rx.blocking_recv()
+            .map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))??;
+
+        open_ctx.is_marked_deleted = true;
         Ok(())
     }
 
@@ -1287,7 +1287,7 @@ impl AsyncFileSystemContext for VirtualFileSystem {
                 let file_info = dir_info.file_info_mut();
                 file_info.file_attributes = node.file_attributes;
                 file_info.reparse_tag = 0;
-                file_info.allocation_size = ((node.size as u64 + 4095) / 4096) * 4096;
+                file_info.allocation_size = node.size as u64;
                 file_info.file_size = node.size as u64;
                 file_info.creation_time = system_time_to_filetime(node.creation_time);
                 file_info.last_access_time = system_time_to_filetime(node.last_access_time);

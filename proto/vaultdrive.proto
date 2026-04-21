@@ -49,6 +49,7 @@ message Request {
     ReAuthenticateRequest reauthenticate = 18;
     RemoveRequest remove = 19;
     FlushFileRequest flush_file = 20;
+    CanDelete can_delete=21;
   }
 }
 
@@ -156,13 +157,17 @@ message WriteFileRequest {
   uint32 flags =6;
   bool compressed = 7;
 
-  optional bool include_file_info = 8;
+  optional bool include_file_info =8;
 }
 
 message FlushFileRequest{
   uint64 file_id =5;
-  optional bool include_file_info = 8;
+  optional bool include_file_info =8;
 
+}
+
+message CanDelete{
+  string path = 1;
 }
 
 message LockRequest{

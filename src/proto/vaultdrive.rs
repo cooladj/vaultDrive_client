@@ -42,7 +42,7 @@ pub mod unix_forward_res {
 pub struct Request {
     #[prost(
         oneof = "request::RequestType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21"
     )]
     pub request_type: ::core::option::Option<request::RequestType>,
 }
@@ -88,6 +88,8 @@ pub mod request {
         Remove(super::RemoveRequest),
         #[prost(message, tag = "20")]
         FlushFile(super::FlushFileRequest),
+        #[prost(message, tag = "21")]
+        CanDelete(super::CanDelete),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -231,6 +233,11 @@ pub struct FlushFileRequest {
     pub file_id: u64,
     #[prost(bool, optional, tag = "8")]
     pub include_file_info: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CanDelete {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LockRequest {
