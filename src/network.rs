@@ -289,8 +289,6 @@ fn tofu_client_config(tofu_enable: bool, token: Option<Vec<u8>> ) -> Result<Clie
 
     Ok(client_config)
 
-
-
 }
 
 #[derive(Debug)]
