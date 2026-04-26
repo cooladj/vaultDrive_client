@@ -87,7 +87,6 @@ message RemoveRequest{
 
 message ReAuthenticateRequest{
   string connection_id = 1;
-  bytes key = 2;
 }
 
 message CloseFileRequest{
@@ -96,7 +95,6 @@ message CloseFileRequest{
 
 message AuthenticationSuccessOuterResponse{
   AuthenticationSuccessResponse authentication_success = 1;
-  bytes key = 2;
 
 
 }
@@ -138,7 +136,6 @@ message CreateFileRequest{
 }
 
 message FileDataResponse {
-  bytes data = 1;
   uint64 offset = 2;
   bool compressed = 7;
 }
@@ -152,7 +149,6 @@ message OpenFileRequest{
 message WriteFileRequest {
   string path = 1;
   uint64 offset = 2;
-  bytes data = 3;
   uint64 file_id =5;
   uint32 flags =6;
   bool compressed = 7;

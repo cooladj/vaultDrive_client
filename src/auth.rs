@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use anyhow::{Context, Result, bail};
-use crate::network::{pin_cert_client_config, read_message, write_message, QuicClient};
+use crate::network::{ read_message, write_message, QuicClient};
 use crate::proto::vaultdrive::*;
 use quinn::{ RecvStream, SendStream};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -43,16 +43,16 @@ pub async fn authenticate(
         )),
     };
     drop(password);
-    write_message(send, &init_req).await?;
-    
-    let auth_response: Response = read_message(recv).await
+    write_message(send, &init_req, &[]).await?;
+
+    let (auth_response, data) = read_message::<Response>(recv).await
         .context("Failed to read authentication response")?;
 
     match auth_response.response_type {
 
         Some(response::ResponseType::AuthenticationSuccess(success)) => {
             tracing::info!("Authentication successful for user: {}", username);
-            connection.key = success.key.clone();
+            connection.key = data;
 
 
                 insert_connection(connection).await;
@@ -83,14 +83,13 @@ pub async fn reauthenticate(
         request_type: Some(request::RequestType::Reauthenticate(
             ReAuthenticateRequest {
                 connection_id: connection.connection_id.clone(),
-                key: connection.key.clone(),
             },
         )),
     };
-    write_message(send, &init_req).await?;
+    write_message(send, &init_req, connection.key.as_slice()).await?;
 
 
-    let auth_response: Response = read_message(recv).await
+    let (auth_response, data) = read_message::<Response>(recv).await
         .context("Failed to read authentication response")?;
 
     match auth_response.response_type {
@@ -99,7 +98,7 @@ pub async fn reauthenticate(
         Some(response::ResponseType::AuthenticationSuccess(success)) => {
             tracing::info!("Authentication successful for user: {}", username);
 
-            update_connect_key(&connection.connection_id, &success.key).await?;
+            update_connect_key(&connection.connection_id, &data).await?;
 
             Ok(success.authentication_success.context("Missing authentication_success field")?)
         }

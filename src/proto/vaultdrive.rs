@@ -139,8 +139,6 @@ pub struct RemoveRequest {
 pub struct ReAuthenticateRequest {
     #[prost(string, tag = "1")]
     pub connection_id: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", tag = "2")]
-    pub key: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CloseFileRequest {
@@ -151,8 +149,6 @@ pub struct CloseFileRequest {
 pub struct AuthenticationSuccessOuterResponse {
     #[prost(message, optional, tag = "1")]
     pub authentication_success: ::core::option::Option<AuthenticationSuccessResponse>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub key: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AuthenticationSuccessResponse {
@@ -192,10 +188,8 @@ pub struct CreateFileRequest {
     #[prost(bool, optional, tag = "8")]
     pub include_file_info: ::core::option::Option<bool>,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileDataResponse {
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint64, tag = "2")]
     pub offset: u64,
     #[prost(bool, tag = "7")]
@@ -216,8 +210,6 @@ pub struct WriteFileRequest {
     pub path: ::prost::alloc::string::String,
     #[prost(uint64, tag = "2")]
     pub offset: u64,
-    #[prost(bytes = "vec", tag = "3")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint64, tag = "5")]
     pub file_id: u64,
     #[prost(uint32, tag = "6")]

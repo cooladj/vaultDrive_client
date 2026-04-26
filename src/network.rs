@@ -227,34 +227,6 @@ impl QuicClient {
 
 }
 
-pub fn pin_cert_client_config(cert:  Vec<u8>) -> Result<ClientConfig> {
-    let mut transport = TransportConfig::default();
-    transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
-
-    let tofu_verifier: PinnedCertVerifier = PinnedCertVerifier{
-        expected_cert: cert,
-    };
-
-
-
-    let mut crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(tofu_verifier))
-        .with_no_client_auth();
-
-    crypto.alpn_protocols = vec![b"vaultdrive".to_vec()];
-
-
-    let mut client_config = ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?
-    ));
-    let mut transport = TransportConfig::default();
-    transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
-    client_config.transport_config(Arc::new(transport));
-
-    Ok(client_config)
-}
-
 
 fn tofu_client_config(tofu_enable: bool, token: Option<Vec<u8>> ) -> Result<ClientConfig> {
     let mut transport = TransportConfig::default();
@@ -264,8 +236,6 @@ fn tofu_client_config(tofu_enable: bool, token: Option<Vec<u8>> ) -> Result<Clie
         tofu_enabled: tofu_enable,
     };
 
-
-
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(tofu_verifier))
@@ -279,13 +249,20 @@ fn tofu_client_config(tofu_enable: bool, token: Option<Vec<u8>> ) -> Result<Clie
     ));
     let mut transport = TransportConfig::default();
     transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
+    debug!("connection with tofu: {}, token: {:?}", tofu_enable, token);
+
     client_config.transport_config(Arc::new(transport));
     if let Some(token) = token {
+        let connection_id =  quinn::ConnectionId::new(&token);
+
+        debug!("connection id: {}", connection_id);
 
         client_config.initial_dst_cid_provider(Arc::new(move || {
-            quinn::ConnectionId::new(&token)
+            connection_id
         }));
+
     }
+
 
     Ok(client_config)
 
@@ -427,29 +404,71 @@ impl ServerCertVerifier for AcceptAllVerifier {
     }
 }
 
+pub async fn write_hub_msg<T: Message>(
+    stream: &mut SendStream,
+    msg: &T,
+) -> Result<()> {
 
-pub async fn write_message<T: Message>(send: &mut SendStream, msg: &T) -> Result<()> {
     let buf = msg.encode_to_vec();
     let mut len_buf = unsigned_varint::encode::usize_buffer();
     let len_encoded = unsigned_varint::encode::usize(buf.len(), &mut len_buf);
+
+    stream.write_all(len_encoded).await.context("Failed to write message len to stream")?;
+
+    stream.write_all(&buf).await
+        .context("Failed to write message data")?;
+
+    Ok(())
+}
+pub async fn read_hub_msg<T: Message + Default>(
+    stream: &mut RecvStream,
+) -> anyhow::Result<T> {
+    let len = aio::read_usize(&mut *stream).await
+        .context("Failed to read length prefix")?;
+
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await
+        .context("Failed to read message data")?;
+
+    T::decode(&*buf).context("Failed to decode message")
+}
+
+
+pub async fn write_message<T: Message>(send: &mut SendStream, msg: &T, data: &[u8]) -> Result<()> {
+    let buf = msg.encode_to_vec();
+    let mut len_buf = unsigned_varint::encode::usize_buffer();
+    let len_encoded = unsigned_varint::encode::usize(buf.len(), &mut len_buf);
+
+    let mut len_data_buf = unsigned_varint::encode::usize_buffer();
+    let data_len_encoded = unsigned_varint::encode::usize(data.len(), &mut len_data_buf);
+
+
     send.write_all(len_encoded).await?;
+    send.write_all(&data_len_encoded).await?;
     send.write_all(&buf).await.context("Failed to write message")?;
+    send.write_all(data).await.context("Failed to write data")?;
 
 
     Ok(())
 }
 
-pub async fn read_message<T: Message + Default>(recv: &mut RecvStream) -> Result<T> {
+pub async fn read_message<T: Message + Default>(recv: &mut RecvStream) -> Result<(T, Vec<u8>)> {
 
     let len = aio::read_usize(&mut *recv).await
         .context("Failed to read length prefix")?;
+    let data_len = aio::read_usize(&mut *recv).await
+        .context("Failed to read data length prefix")?;
     let mut msg_buf = vec![0u8; len];
     recv.read_exact(&mut msg_buf).await
         .context("Failed to read message body")?;
-    
+    let mut data_buf = vec![0u8; data_len];
+    recv.read_exact(&mut data_buf).await
+        .context("Failed to read data body")?;
 
-    T::decode(&msg_buf[..])
-        .context("Failed to decode message")
+    let msg=T::decode(&msg_buf[..])
+        .context("Failed to decode message")?;
+
+    Ok((msg, data_buf))
 }
 
 
