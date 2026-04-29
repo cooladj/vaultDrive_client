@@ -7,9 +7,11 @@ use parking_lot::{Once};
 use std::ffi::c_void;
 use std::future::Future;
 use std::{io, };
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use bytes::Bytes;
 use parking_lot::{RwLock, Mutex};
 use tokio::sync::{oneshot,};
 
@@ -1050,6 +1052,9 @@ impl AsyncFileSystemContext for VirtualFileSystem {
             .ok_or(FspError::from(NTSTATUS(STATUS_INVALID_HANDLE)))
             .map(|r| r.clone());
 
+
+
+
         const CHUNK_SIZE: usize = 256 * 1024; // 256KB
 
         async move {
@@ -1080,6 +1085,7 @@ impl AsyncFileSystemContext for VirtualFileSystem {
             let mut futures = Vec::new();
             let mut chunk_offset = 0usize;
 
+
             while chunk_offset < total_len {
                 let chunk_len = CHUNK_SIZE.min(total_len - chunk_offset);
                 let file_offset = offset + chunk_offset as u64;
@@ -1093,7 +1099,7 @@ impl AsyncFileSystemContext for VirtualFileSystem {
                         .read_file(&path, file_offset, chunk_len as u32, ctx, compress)
                         .await
                         .map_err(|e| FspError::from(IO(e.kind())))?;
-                    Ok::<(usize, Vec<u8>), FspError>((chunk_offset, data))
+                    Ok::<(usize,Bytes), FspError>((chunk_offset, data))
                 });
 
                 chunk_offset += chunk_len;
@@ -1152,9 +1158,10 @@ impl AsyncFileSystemContext for VirtualFileSystem {
                     .entry(context.clone())
                     .or_insert_with(|| JoinSet::new())
                     .spawn({
+
                         let buffer = buffer.to_vec();
                         async move{
-                            client.write_file(&path, offset, &buffer, context.clone(), flags, compress, is_compressed, Some(false), Some(stream))
+                            client.write_file(&path, offset, Cow::Owned(buffer), context.clone(), flags, compress, is_compressed, Some(false), Some(stream))
                                 .await
                         }
                     });
@@ -1162,7 +1169,7 @@ impl AsyncFileSystemContext for VirtualFileSystem {
                 return Ok(buffer.len() as u32);
             }
 
-            let written = self.client.write_file(&open_ctx.path, offset, buffer, context.clone(),open_ctx.flags, self.compress.clone(), open_ctx.is_compressed, Some(true), None)
+            let written = self.client.write_file(&open_ctx.path, offset, Cow::Borrowed(buffer), context.clone(),open_ctx.flags, self.compress.clone(), open_ctx.is_compressed, Some(true), None)
                 .await
                 .map_err(|_| FspError::from(NTSTATUS(STATUS_INTERNAL_ERROR.0)))?;
 
@@ -1322,7 +1329,7 @@ pub async fn mount(client: Arc<VaultDriveClient>, mount_point: &mut String, driv
     }
     tracing::info!("Mounting VaultDrive at {}", mount_point);
 
-    let mut mount_point = normalize_mount_point(mount_point)?;
+    let mount_point = normalize_mount_point(mount_point)?;
     let handle = Handle::current();
 
     let fs = VirtualFileSystem::new(client.clone(),  handle, drive.to_string(), scope.clone(), compression.clone());
@@ -1335,13 +1342,11 @@ pub async fn mount(client: Arc<VaultDriveClient>, mount_point: &mut String, driv
     volume_params.sectors_per_allocation_unit(1);
     volume_params.volume_creation_time(system_time_to_filetime(std::time::SystemTime::now()));
     volume_params.volume_serial_number(0);
-    volume_params.volume_info_timeout(1000);
-    volume_params.file_info_timeout(10);
-    volume_params.dir_info_timeout(10);
-    volume_params.security_timeout(1000);
+    volume_params.file_info_timeout(u32::MAX);
+
     volume_params.allow_open_in_kernel_mode(true);
     volume_params.flush_and_purge_on_cleanup(false);
-    volume_params.post_cleanup_when_modified_only(false);
+    volume_params.post_cleanup_when_modified_only(true);
 
 
 

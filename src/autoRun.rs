@@ -1,4 +1,5 @@
-﻿use sqlx::{Row, SqliteConnection};
+﻿use bytes::Bytes;
+use sqlx::{Row, SqliteConnection};
 use sqlx::Connection;
 use rusqlite;
 use x509_parser::asn1_rs::Boolean;
@@ -10,7 +11,7 @@ pub struct connection {
     pub connection_type: ConnectionType,
     pub connection_point: String,
     pub username: String,
-    pub key: Vec<u8>,
+    pub key: Bytes,
     pub scope: String,
     pub mounts: Option<Vec<mounts>>,
 }
@@ -39,7 +40,7 @@ pub async fn insert_connection(connection: connection) -> anyhow::Result<()> {
         .bind(&connection.connection_point)
         .bind(&connection.username)
         .bind(&connection.scope)
-        .bind(&connection.key)
+        .bind(&connection.key.as_ref())
         .execute(&mut conn)
         .await?;
     Ok(())
@@ -133,7 +134,7 @@ pub async fn get_connection_from_db(
         connection_point: connection_point.to_string(),
         username: username.to_string(),
         scope: scope.to_string(),
-        key: row.get("key"),
+        key: Bytes::from(row.get::<Vec<u8>, _>("key")),
         mounts: None,
     })
 }
@@ -255,7 +256,7 @@ pub async fn get_connections_with_mounts() -> anyhow::Result<Vec<connection>> {
                     connection_type: ConnectionType::from_i32(row.get("connection_type"))?,
                     connection_point: row.get("connection_point"),
                     username: row.get("username"),
-                    key: row.get("key"),
+                    key: Bytes::from(row.get::<Vec<u8>, _>("key")),
                     scope: row.get("conn_scope"),
                     mounts: Some(vec![mount]),
                 });

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use anyhow::{Context, Result, bail};
@@ -43,7 +44,7 @@ pub async fn authenticate(
         )),
     };
     drop(password);
-    write_message(send, &init_req, &[]).await?;
+    write_message(send, &init_req, Cow::Borrowed(&[])).await?;
 
     let (auth_response, data) = read_message::<Response>(recv).await
         .context("Failed to read authentication response")?;
@@ -86,7 +87,7 @@ pub async fn reauthenticate(
             },
         )),
     };
-    write_message(send, &init_req, connection.key.as_slice()).await?;
+    write_message(send, &init_req, Cow::Owned(connection.key.to_vec())).await?;
 
 
     let (auth_response, data) = read_message::<Response>(recv).await

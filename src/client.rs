@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::{DashMap};
 
 use log::info;
@@ -363,7 +363,7 @@ impl VaultDriveClient {
             connection_point,
             username: username.to_string(),
             scope: self.scope.clone(),
-            key: Vec::new(),
+            key: Bytes::new(),
             mounts: None,
         };
 
@@ -377,7 +377,7 @@ impl VaultDriveClient {
 
 
 
-    async fn execute_request(&self, request: Request, data: &[u8],stream: Option<(SendStream, RecvStream)>) -> Result<(Response, Vec<u8>)> {
+    async fn execute_request<'a>(&self, request: Request, data: Cow<'a, [u8]>,stream: Option<(SendStream, RecvStream)>) -> Result<(Response,Bytes)> {
 
 
         let (mut send, mut recv) = if let Some((send, recv)) = stream {
@@ -413,7 +413,7 @@ impl VaultDriveClient {
         };
 
         let (response, _) = self
-            .execute_request(request,&[], None )
+            .execute_request(request,Cow::Borrowed(&[]), None )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -437,7 +437,7 @@ impl VaultDriveClient {
 
 
         let (response, _) = self
-            .execute_request(request, &[],None)
+            .execute_request(request, Cow::Borrowed(&[]),None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -462,7 +462,7 @@ impl VaultDriveClient {
             })),
         };
         let (response, _) = self
-            .execute_request(request, &[],None)
+            .execute_request(request, Cow::Borrowed(&[]),None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -487,7 +487,7 @@ impl VaultDriveClient {
         };
 
         let (response, _) = self
-            .execute_request(request, &[],None)
+            .execute_request(request, Cow::Borrowed(&[]),None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -504,7 +504,7 @@ impl VaultDriveClient {
         }
     }
 
-    pub async fn read_file(&self, path: &str, offset: u64, length: u32, file_id: u64, compress: Arc<AtomicBool>) -> io::Result<Vec<u8>> {
+    pub async fn read_file(&self, path: &str, offset: u64, length: u32, file_id: u64, compress: Arc<AtomicBool>) -> io::Result<Bytes> {
 
 
         let request = Request {
@@ -518,7 +518,7 @@ impl VaultDriveClient {
         };
 
         let (response, data) = self
-            .execute_request(request, &[],None)
+            .execute_request(request, Cow::Borrowed(&[]),None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -526,8 +526,8 @@ impl VaultDriveClient {
         match response.response_type {
             Some(response::ResponseType::FileData(metadata)) => {
                 let bytes = if metadata.compressed {
-                    let decompressed = zstd::decode_all(data.as_slice())?;
-                    decompressed
+                  bytes::Bytes::from(zstd::decode_all(data.as_ref())?)
+
                 } else {
                     data
                 };
@@ -549,7 +549,7 @@ impl VaultDriveClient {
             })),
         };
         let (response,_) = self
-            .execute_request(request, &[],None)
+            .execute_request(request, Cow::Borrowed(&[]),None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -576,7 +576,7 @@ impl VaultDriveClient {
             })),
         };
         let (response,_ ) = self
-            .execute_request(request, &[],None)
+            .execute_request(request, Cow::Borrowed(&[]),None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -590,13 +590,11 @@ impl VaultDriveClient {
         }
     }
 
-
-
-    pub async fn write_file(
+    pub async fn write_file<'a>(
         &self,
         path: &str,
         offset: u64,
-        data: &[u8],
+        data: Cow<'a, [u8]>,
         file_id: u64,
         flags: u32,
         compress: Arc<AtomicBool>,
@@ -604,15 +602,15 @@ impl VaultDriveClient {
         include_file_info: Option<bool>,
         stream: Option<(SendStream, RecvStream)>,
     ) -> io::Result<WriteSuccessResponse> {
-        let (data, compressed): (Cow<[u8]>, bool) = if compress.load(Ordering::Relaxed) && !is_compressed {
-            let c = zstd::encode_all(data, 3)?;
+        let (data, compressed) = if compress.load(Ordering::Relaxed) && !is_compressed {
+            let c = zstd::encode_all(data.as_ref(), 3)?;
             if c.len() < data.len() {
                 (Cow::Owned(c), true)
             } else {
-                (Cow::Borrowed(data), false)
+                (data, false)
             }
         } else {
-            (Cow::Borrowed(data), false)
+            (data, false)
         };
 
         let request = Request {
@@ -622,12 +620,12 @@ impl VaultDriveClient {
                 file_id,
                 flags,
                 compressed,
-                include_file_info
+                include_file_info,
             })),
         };
 
         let (response, _) = self
-            .execute_request(request, &data,stream)
+            .execute_request(request, data, stream)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -640,6 +638,8 @@ impl VaultDriveClient {
             )),
         }
     }
+
+
     pub async fn close_file(&self, file_handler: u64) -> io::Result<()> {
         let request = Request{
             request_type:Some(request::RequestType::CloseFile(CloseFileRequest{
@@ -647,7 +647,7 @@ impl VaultDriveClient {
             }))
         };
         let (response, _) = self
-            .execute_request(request,&[] ,None)
+            .execute_request(request,Cow::Borrowed(&[]) ,None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -668,7 +668,7 @@ impl VaultDriveClient {
         };
 
         let (response, _) = self
-            .execute_request(request, &[], None)
+            .execute_request(request, Cow::Borrowed(&[]), None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         match response.response_type {
@@ -691,7 +691,7 @@ impl VaultDriveClient {
         };
 
         let (response, _) = self
-            .execute_request(request, &[],None)
+            .execute_request(request, Cow::Borrowed(&[]),None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -716,7 +716,7 @@ impl VaultDriveClient {
         };
 
         let (response, _) = self
-            .execute_request(request, &[], None)
+            .execute_request(request, Cow::Borrowed(&[]), None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -741,7 +741,7 @@ impl VaultDriveClient {
         };
 
         let (response, _) = self
-            .execute_request(request, &[],None)
+            .execute_request(request, Cow::Borrowed(&[]),None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -763,7 +763,7 @@ impl VaultDriveClient {
         };
 
         let (response, _) = self
-            .execute_request(request, &[], None)
+            .execute_request(request, Cow::Borrowed(&[]), None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -783,7 +783,7 @@ impl VaultDriveClient {
         };
 
         let (response, _) = self
-            .execute_request(request, &[], None)
+            .execute_request(request,Cow::Borrowed(&[]), None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -806,7 +806,7 @@ impl VaultDriveClient {
         };
 
          let (response, _) = self
-            .execute_request(request, &[], None)
+            .execute_request(request, Cow::Borrowed(&[]), None)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -848,7 +848,7 @@ impl VaultDriveClient {
         self.mounts.clear();
 
 
-        self.execute_request(request, &[],None).await?;
+        self.execute_request(request, Cow::Borrowed(&[]),None).await?;
 
         let server_addr = *server_addr_guard;
         let username = session_guard.as_ref().unwrap().authenticate_request.user_id.clone();

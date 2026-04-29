@@ -1,5 +1,7 @@
+use std::borrow::Cow;
+use std::cmp::min;
 use std::io;
-use std::io::IoSliceMut;
+use std::io::{Cursor, IoSliceMut, Read};
 use anyhow::{Context, Result, bail, anyhow};
 use quinn::{Connection, Endpoint, RecvStream, SendStream, ClientConfig, TransportConfig, congestion, AsyncUdpSocket, UdpPoller};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -8,22 +10,27 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes_utils::SegmentedBuf;
+use bytes_varint::{VarIntSupportMut, VarIntSupport};
 use dashmap::{DashMap, Equivalent};
+use futures::AsyncWriteExt as future_async;
 use futures::future::join_all;
 use log::debug;
 use prost::Message;
+
 
 use rcgen::{ CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::{DigitallySignedStruct, RootCertStore};
 use tokio::io::{join, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy};
 use quinn::udp::{RecvMeta, Transmit};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
 use tracing::error;
 use unsigned_varint::aio;
+use unsigned_varint::encode::usize;
 use crate::autoRun::{contain_cert, insert_cert};
 use crate::client::{ VAULT_DRIVE_MAP};
 use crate::commands::{connection_direct};
@@ -408,67 +415,213 @@ pub async fn write_hub_msg<T: Message>(
     stream: &mut SendStream,
     msg: &T,
 ) -> Result<()> {
+    let msg_len = msg.encoded_len();
+    let mut header_mut = BytesMut::with_capacity(10 + msg_len);
 
-    let buf = msg.encode_to_vec();
-    let mut len_buf = unsigned_varint::encode::usize_buffer();
-    let len_encoded = unsigned_varint::encode::usize(buf.len(), &mut len_buf);
+    header_mut.put_usize_varint(msg_len);
+    msg.encode(&mut header_mut).context("encode message")?;
 
-    stream.write_all(len_encoded).await.context("Failed to write message len to stream")?;
-
-    stream.write_all(&buf).await
-        .context("Failed to write message data")?;
+    stream.write_chunk(header_mut.freeze()).await?;
 
     Ok(())
 }
 pub async fn read_hub_msg<T: Message + Default>(
     stream: &mut RecvStream,
 ) -> anyhow::Result<T> {
-    let len = aio::read_usize(&mut *stream).await
-        .context("Failed to read length prefix")?;
+    let mut bufs = SegmentedBuf::new();
+    let mut msg_len: Option<usize> = None;
 
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await
-        .context("Failed to read message data")?;
+    loop {
+        let chunk = stream.read_chunk(usize::MAX, true).await?
+            .ok_or_else(|| anyhow::anyhow!("stream closed"))?.bytes;
 
-    T::decode(&*buf).context("Failed to decode message")
+        if bufs.remaining() == 0 && msg_len.is_none() {
+            let mut cursor = Cursor::new(chunk.clone());
+
+            let Ok(m_len) = cursor.try_get_usize_varint() else {
+                bufs.push(chunk);
+                continue;
+            };
+
+            let header_end = cursor.position() as usize;
+
+            if cursor.remaining() >= m_len {
+                let msg = T::decode(&chunk[header_end..header_end + m_len])
+                    .context("decode message")?;
+                return Ok(msg);
+            }
+
+            msg_len = Some(m_len);
+            bufs.push(chunk.slice(header_end..));
+            continue;
+        }
+
+        bufs.push(chunk);
+
+        if msg_len.is_none() {
+            match bufs.try_get_usize_varint() {
+                Ok(n) => msg_len = Some(n),
+                Err(_) => continue,
+            }
+        }
+
+        let m_len = msg_len.unwrap();
+
+        if bufs.remaining() < m_len {
+            continue;
+        }
+
+
+        let msg = T::decode((&mut bufs).take(m_len))
+            .context("decode message")?;
+        return Ok(msg);
+    }
 }
 
 
-pub async fn write_message<T: Message>(send: &mut SendStream, msg: &T, data: &[u8]) -> Result<()> {
-    let buf = msg.encode_to_vec();
-    let mut len_buf = unsigned_varint::encode::usize_buffer();
-    let len_encoded = unsigned_varint::encode::usize(buf.len(), &mut len_buf);
-
-    let mut len_data_buf = unsigned_varint::encode::usize_buffer();
-    let data_len_encoded = unsigned_varint::encode::usize(data.len(), &mut len_data_buf);
 
 
-    send.write_all(len_encoded).await?;
-    send.write_all(&data_len_encoded).await?;
-    send.write_all(&buf).await.context("Failed to write message")?;
-    send.write_all(data).await.context("Failed to write data")?;
+pub async fn write_message<'a, T: Message>(
+    send: &mut SendStream,
+    msg: &T,
+    data: Cow<'a, [u8]>,
+) -> Result<()> {
+    let msg_len = msg.encoded_len();
+    let data_len = data.len();
+    let mut header_mut = BytesMut::with_capacity(20 + msg_len);
 
+    header_mut.put_usize_varint(msg_len );
+    header_mut.put_usize_varint(data_len );
+    msg.encode(&mut header_mut).context("encode message")?;
+    let header = header_mut.freeze();
+
+    match data {
+        Cow::Borrowed(inner) => {
+            send.write_chunk(header).await?;
+            if data_len >0 {
+                send.write_all(inner).await?;
+            }
+        }
+        Cow::Owned(inner) => {
+            if data_len > 0 {
+                let mut chunks = [header, Bytes::from(inner)];
+
+                send.write_all_chunks(&mut chunks).await.context("write frame")?;
+            }
+            else {
+                send.write_chunk(header).await?;
+            }
+        }
+    }
 
     Ok(())
 }
 
-pub async fn read_message<T: Message + Default>(recv: &mut RecvStream) -> Result<(T, Vec<u8>)> {
 
-    let len = aio::read_usize(&mut *recv).await
-        .context("Failed to read length prefix")?;
-    let data_len = aio::read_usize(&mut *recv).await
-        .context("Failed to read data length prefix")?;
-    let mut msg_buf = vec![0u8; len];
-    recv.read_exact(&mut msg_buf).await
-        .context("Failed to read message body")?;
-    let mut data_buf = vec![0u8; data_len];
-    recv.read_exact(&mut data_buf).await
-        .context("Failed to read data body")?;
+pub async fn read_message<T: Message + Default>(
+    recv: &mut RecvStream,
+) -> anyhow::Result<(T, Bytes)> {
+    let mut bufs = SegmentedBuf::new();
+    let mut msg_len: Option<usize> = None;
+    let mut data_len: Option<usize> = None;
 
-    let msg=T::decode(&msg_buf[..])
-        .context("Failed to decode message")?;
+    loop {
+        let chunk = recv.read_chunk(usize::MAX, true).await?
+            .ok_or_else(|| anyhow::anyhow!("stream closed"))?.bytes;
 
-    Ok((msg, data_buf))
+
+
+        if bufs.remaining() ==0 {
+            let mut cursor = Cursor::new(chunk.clone());
+
+            let Ok(m_len) = cursor.try_get_usize_varint() else {
+                bufs.push(chunk);
+                continue;
+            };
+
+            let Ok(d_len) = cursor.try_get_usize_varint() else {
+                msg_len = Some(m_len);
+                bufs.push(chunk.slice(cursor.position() as usize..));
+                continue;
+            };
+
+            let header_end = cursor.position() as usize;
+
+            if cursor.remaining() >= m_len + d_len {
+                // Everything in one chunk — zero copy
+                let msg = T::decode(&chunk[header_end..header_end + m_len])
+                    .context("decode message")?;
+                let data = chunk.slice(header_end + m_len..header_end + m_len + d_len);
+                return Ok((msg, data));
+            }
+
+            msg_len = Some(m_len);
+            data_len = Some(d_len);
+            bufs.push(chunk.slice(header_end..)); // pre-advanced past header
+            continue;
+        }
+
+        bufs.push(chunk);
+
+        if msg_len.is_none() {
+            match bufs.try_get_usize_varint() {
+                Ok(n) => msg_len = Some(n),
+                Err(_) => continue,
+            }
+        }
+
+        if data_len.is_none() {
+            match bufs.try_get_usize_varint() {
+                Ok(n) => data_len = Some(n),
+                Err(_) => continue,
+            }
+        }
+
+        let m_len = msg_len.unwrap();
+        let d_len = data_len.unwrap();
+
+        if bufs.remaining() < m_len + d_len {
+            continue;
+        }
+
+        let msg = T::decode((&mut bufs).take(m_len))
+            .context("decode message")?;
+        let data = if d_len >  0 {
+            ///chances to be zero copy as
+            bufs.copy_to_bytes(d_len)
+        }else {
+            Bytes::new()
+        };
+        return Ok((msg, data));
+    }
 }
 
+pub async fn read_messages<T: Message + Default>(
+    recv: &mut RecvStream,
+) -> Result<(T, Bytes)> {
+
+    let msg_len = aio::read_usize(&mut *recv).await
+        .context("Failed to read message length prefix")?;
+    let data_len = aio::read_usize(&mut *recv).await
+        .context("Failed to read data length prefix")?;
+    let total = msg_len + data_len;
+
+
+    let mut combined = BytesMut::with_capacity(total );
+    while combined.len()  < total {
+        let n = recv.read_buf(&mut combined).await
+            .context("Failed to read frame body")?;
+        if n == 0 {
+            return Err(anyhow!("unexpected EOF reading frame body"));
+        }
+    }
+
+    let mut combined = combined.freeze();
+    let msg_bytes = combined.split_to(msg_len as usize);
+
+    let msg = T::decode(msg_bytes)
+        .context("Failed to decode message")?;
+
+    Ok((msg, combined))
+}
 
